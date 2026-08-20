@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>TruthLens AI</title>
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Tailwind Configuration -->
+    <script>
+
+        tailwind.config = {
+
+            theme: {
+
+                extend: {
+
+                    fontFamily: {
+                        sans: ["Inter", "sans-serif"]
+                    }
+
+                }
+
+            }
+
+        };
+
+    </script>
+
+    <!-- Google Font -->
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+        rel="stylesheet"
+    >
+
+</head>
+
+
+<body class="min-h-screen bg-slate-950 text-white font-sans">
+
+
+    <!-- ====================================================== -->
+    <!-- HEADER -->
+    <!-- ====================================================== -->
+
+    <header
+        class="border-b border-slate-800 bg-slate-950/95"
+    >
+
+        <div
+            class="max-w-7xl mx-auto px-6 py-5"
+        >
+
+            <div
+                class="flex items-center justify-between"
+            >
+
+                <!-- BRAND -->
+
+                <div
+                    class="flex items-center gap-3"
+                >
+
+                    <div
+                        class="
+                            w-11 h-11
+                            rounded-xl
+                            bg-blue-600
+                            flex items-center justify-center
+                            shadow-lg shadow-blue-600/30
+                        "
+                    >
+
+                        <span
+                            class="text-xl font-bold"
+                        >
+                            T
+                        </span>
+
+                    </div>
+
+
+                    <div>
+
+                        <h1
+                            class="text-xl font-bold tracking-tight"
+                        >
+                            TruthLens AI
+                        </h1>
+
+                        <p
+                            class="text-xs text-slate-400"
+                        >
+                            AI-Powered Misinformation Analysis
+                        </p>
+
+                    </div>
+
+                </div>
+
+
+                <!-- STATUS -->
+
+                <div
+                    class="
+                        hidden sm:flex
+                        items-center gap-2
+                        px-3 py-2
+                        rounded-full
+                        bg-slate-900
+                        border border-slate-800
+                    "
+                >
+
+                    <span
+                        class="
+                            w-2 h-2
+                            bg-emerald-400
+                            rounded-full
+                        "
+                    ></span>
+
+                    <span
+                        class="text-xs text-slate-300"
+                    >
+                        System Ready
+                    </span>
+
+                </div>
+
+            </div>
+
+        </div>
+
+    </header>
+
+
+
+    <!-- ====================================================== -->
+    <!-- MAIN -->
+    <!-- ====================================================== -->
+
+    <main
+        class="
+            max-w-5xl
+            mx-auto
+            px-6
+            py-16
+        "
+    >
+
+
+        <!-- ================================================== -->
+        <!-- HERO -->
+        <!-- ================================================== -->
+
+        <section
+            class="text-center mb-12"
+        >
+
+            <div
+                class="
+                    inline-flex
+                    items-center gap-2
+                    px-4 py-2
+                    mb-6
+                    rounded-full
+                    bg-blue-500/10
+                    border border-blue-500/20
+                    text-blue-400
+                    text-sm
+                "
+            >
+
+                <span>✦</span>
+
+                <span>
+                    Detect • Analyze • Explain • Verify
+                </span>
+
+            </div>
+
+
+            <h2
+                class="
+                    text-4xl
+                    md:text-6xl
+                    font-extrabold
+                    tracking-tight
+                    leading-tight
+                "
+            >
+
+                Analyze information
+
+                <span
+                    class="text-blue-500"
+                >
+                    before you trust it.
+                </span>
+
+            </h2>
+
+
+            <p
+                class="
+                    max-w-2xl
+                    mx-auto
+                    mt-6
+                    text-slate-400
+                    text-lg
+                    leading-relaxed
+                "
+            >
+
+                TruthLens AI analyzes potentially misleading
+                content and helps you understand its reliability
+                using AI, explanations and evidence.
+
+            </p>
+
+        </section>
+
+
+
+        <!-- ================================================== -->
+        <!-- ANALYSIS CARD -->
+        <!-- ================================================== -->
+
+        <section
+            class="
+                bg-slate-900
+                border border-slate-800
+                rounded-2xl
+                p-6 md:p-8
+                shadow-2xl
+            "
+        >
+
+            <div
+                class="
+                    flex
+                    items-center
+                    justify-between
+                    mb-5
+                "
+            >
+
+                <div>
+
+                    <h3
+                        class="text-xl font-semibold"
+                    >
+                        Analyze Content
+                    </h3>
+
+                    <p
+                        class="
+                            text-sm
+                            text-slate-400
+                            mt-1
+                        "
+                    >
+                        Paste a claim, headline,
+                        article or social media post.
+                    </p>
+
+                </div>
+
+
+                <span
+                    class="
+                        hidden sm:block
+                        text-xs
+                        text-slate-500
+                    "
+                >
+                    Text Analysis
+                </span>
+
+            </div>
+
+
+            <!-- INPUT -->
+
+            <textarea
+                id="contentInput"
+                rows="8"
+                placeholder="Paste the content you want TruthLens AI to analyze..."
+                class="
+                    w-full
+                    resize-none
+                    rounded-xl
+                    bg-slate-950
+                    border border-slate-700
+                    px-5 py-4
+                    text-slate-200
+                    placeholder-slate-600
+                    outline-none
+                    transition
+                    focus:border-blue-500
+                    focus:ring-2
+                    focus:ring-blue-500/20
+                "
+            ></textarea>
+
+
+            <!-- BUTTON -->
+
+            <div
+                class="
+                    flex
+                    flex-col
+                    sm:flex-row
+                    items-center
+                    justify-between
+                    gap-4
+                    mt-5
+                "
+            >
+
+                <p
+                    class="text-xs text-slate-500"
+                >
+                    Your content will be analyzed
+                    for potentially misleading information.
+                </p>
+
+
+                <button
+                    id="analyzeButton"
+                    class="
+                        w-full
+                        sm:w-auto
+                        px-7 py-3
+                        rounded-xl
+                        bg-blue-600
+                        hover:bg-blue-500
+                        active:bg-blue-700
+                        transition
+                        font-semibold
+                        shadow-lg
+                        shadow-blue-600/20
+                    "
+                >
+                    Analyze Content
+                </button>
+
+            </div>
+
+        </section>
+
+
+
+        <!-- ================================================== -->
+        <!-- RESULT -->
+        <!-- ================================================== -->
+
+        <section
+            id="resultSection"
+            class="
+                mt-8
+                bg-slate-900
+                border border-slate-800
+                rounded-2xl
+                p-6 md:p-8
+            "
+        >
+
+            <div
+                class="
+                    flex
+                    items-center
+                    justify-between
+                    mb-6
+                "
+            >
+
+                <div>
+
+                    <h3
+                        class="text-xl font-semibold"
+                    >
+                        Analysis Result
+                    </h3>
+
+                    <p
+                        class="
+                            text-sm
+                            text-slate-400
+                            mt-1
+                        "
+                    >
+                        Your analysis will appear here.
+                    </p>
+
+                </div>
+
+
+                <div
+                    class="
+                        px-3 py-1
+                        rounded-full
+                        bg-slate-800
+                        text-xs
+                        text-slate-400
+                    "
+                >
+                    Waiting
+                </div>
+
+            </div>
+
+
+            <div
+                id="resultContent"
+                class="
+                    rounded-xl
+                    border border-dashed
+                    border-slate-700
+                    p-8
+                    text-center
+                "
+            >
+
+                <div
+                    class="text-4xl mb-4"
+                >
+                    🔍
+                </div>
+
+                <p
+                    class="text-slate-400"
+                >
+                    Enter some content above and click
+
+                    <span
+                        class="
+                            text-white
+                            font-medium
+                        "
+                    >
+                        Analyze Content
+                    </span>
+
+                    to begin.
+
+                </p>
+
+            </div>
+
+        </section>
+
+
+
+        <!-- ================================================== -->
+        <!-- VERIFICATION HISTORY -->
+        <!-- ================================================== -->
+
+        <section
+            id="verificationHistory"
+            class="
+                mt-8
+                bg-slate-900
+                border border-slate-800
+                rounded-2xl
+                p-6 md:p-8
+            "
+        >
+
+            <div
+                class="
+                    flex
+                    items-center
+                    justify-between
+                    mb-6
+                "
+            >
+
+                <div>
+
+                    <h3
+                        class="
+                            text-xl
+                            font-semibold
+                        "
+                    >
+                        Verification History
+                    </h3>
+
+                    <p
+                        class="
+                            text-sm
+                            text-slate-400
+                            mt-1
+                        "
+                    >
+                        Your recent TruthLens AI
+                        verification results.
+                    </p>
+
+                </div>
+
+
+                <span
+                    class="
+                        hidden sm:block
+                        text-xs
+                        text-slate-500
+                    "
+                >
+                    Latest 10
+                </span>
+
+            </div>
+
+
+            <div
+                id="verificationHistoryContent"
+            >
+
+                <div
+                    class="
+                        text-center
+                        py-8
+                    "
+                >
+
+                    <div
+                        class="text-3xl mb-3"
+                    >
+                        🕘
+                    </div>
+
+                    <p
+                        class="text-slate-400"
+                    >
+                        No verification history yet.
+                    </p>
+
+                    <p
+                        class="
+                            text-xs
+                            text-slate-600
+                            mt-2
+                        "
+                    >
+                        Analyze a claim to create
+                        your first history entry.
+                    </p>
+
+                </div>
+
+            </div>
+
+        </section>
+
+
+
+        <!-- ================================================== -->
+        <!-- FEATURES -->
+        <!-- ================================================== -->
+
+        <section
+            class="
+                grid
+                md:grid-cols-3
+                gap-5
+                mt-8
+            "
+        >
+
+
+            <!-- FEATURE 1 -->
+
+            <div
+                class="
+                    bg-slate-900
+                    border border-slate-800
+                    rounded-xl
+                    p-5
+                "
+            >
+
+                <div
+                    class="text-2xl mb-3"
+                >
+                    🧠
+                </div>
+
+                <h4
+                    class="font-semibold mb-2"
+                >
+                    AI Analysis
+                </h4>
+
+                <p
+                    class="
+                        text-sm
+                        text-slate-400
+                        leading-relaxed
+                    "
+                >
+                    Analyze content using machine
+                    learning and transformer-based models.
+                </p>
+
+            </div>
+
+
+            <!-- FEATURE 2 -->
+
+            <div
+                class="
+                    bg-slate-900
+                    border border-slate-800
+                    rounded-xl
+                    p-5
+                "
+            >
+
+                <div
+                    class="text-2xl mb-3"
+                >
+                    🔎
+                </div>
+
+                <h4
+                    class="font-semibold mb-2"
+                >
+                    Explainable Results
+                </h4>
+
+                <p
+                    class="
+                        text-sm
+                        text-slate-400
+                        leading-relaxed
+                    "
+                >
+                    Understand the factors that
+                    influence the system's analysis.
+                </p>
+
+            </div>
+
+
+            <!-- FEATURE 3 -->
+
+            <div
+                class="
+                    bg-slate-900
+                    border border-slate-800
+                    rounded-xl
+                    p-5
+                "
+            >
+
+                <div
+                    class="text-2xl mb-3"
+                >
+                    🛡️
+                </div>
+
+                <h4
+                    class="font-semibold mb-2"
+                >
+                    Evidence Support
+                </h4>
+
+                <p
+                    class="
+                        text-sm
+                        text-slate-400
+                        leading-relaxed
+                    "
+                >
+                    Retrieve supporting and contradicting
+                    evidence from relevant information sources.
+                </p>
+
+            </div>
+
+        </section>
+
+
+    </main>
+
+
+
+    <!-- ====================================================== -->
+    <!-- FOOTER -->
+    <!-- ====================================================== -->
+
+    <footer
+        class="
+            border-t
+            border-slate-800
+            mt-12
+        "
+    >
+
+        <div
+            class="
+                max-w-7xl
+                mx-auto
+                px-6
+                py-6
+                text-center
+                text-sm
+                text-slate-500
+            "
+        >
+            © 2026 TruthLens AI ·
+            AI-Powered Misinformation Analysis
+        </div>
+
+    </footer>
+
+
+
+    <!-- ====================================================== -->
+    <!-- JAVASCRIPT -->
+    <!-- ====================================================== -->
+
+    <script src="script.js"></script>
+
+</body>
+
+</html>
