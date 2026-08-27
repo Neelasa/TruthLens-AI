@@ -1,0 +1,2 @@
+Model,Validation Accuracy,Validation Macro F1,Test Accuracy,Test Macro F1
+TF-IDF + Logistic Regression,0.2468847352024922,0.24871351596442506,0.2541436464088398,0.25165198022585433
