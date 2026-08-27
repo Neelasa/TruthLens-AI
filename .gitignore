@@ -1,6 +1,31 @@
+# Python virtual environment
 venv/
+.venv/
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Environment variables
 .env
+
+# Git
 .git/
+
+# VS Code
 .vscode/
+
+# Large trained model/checkpoint files
+models/distilbert_checkpoints/
+models/distilbert_truthlens/model.safetensors
+
+# Training artifacts
+*.pt
+*.pth
+*.safetensors
+
+# Temporary files
+*.tmp
+*.log
