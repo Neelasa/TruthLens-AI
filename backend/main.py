@@ -2308,7 +2308,8 @@ print("Deterministic Verification: ACTIVE")
 print(
     "NLI Verification:",
     "ACTIVE" if NLI_AVAILABLE else "DISABLED",
-)print("Source Reliability: ACTIVE")
+)
+print("Source Reliability: ACTIVE")
 print("Evidence Quality: ACTIVE")
 print("India Classification Contradiction Guard: ACTIVE")
 print("=" * 70)
