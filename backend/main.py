@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import re
 import time
 import requests
@@ -13,6 +14,7 @@ from transformers import (
     AutoModelForSequenceClassification,
 )
 
+from huggingface_hub import snapshot_download
 
 # ============================================================
 # TruthLens AI Backend
@@ -58,6 +60,17 @@ class AnalyzeRequest(BaseModel):
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Hugging Face model repository
+# Model files are stored inside the repository's
+# "distilbert_truthlens" subfolder.
+HF_MODEL_REPO = os.getenv(
+    "HF_MODEL_REPO",
+    "neelu4304/TruthLensAI-distilbert",
+)
+
+HF_MODEL_SUBFOLDER = "distilbert_truthlens"
+
+# Local model is kept as a fallback for local development.
 MODEL_PATH = BASE_DIR / "models" / "distilbert_truthlens"
 
 DEVICE = torch.device(
@@ -113,19 +126,138 @@ print("Device:", DEVICE)
 print("Model path:", MODEL_PATH)
 print("-" * 70)
 print("Loading TruthLens DistilBERT...")
+print("Hugging Face repository:", HF_MODEL_REPO)
+print("Hugging Face subfolder:", HF_MODEL_SUBFOLDER)
 
-tokenizer = AutoTokenizer.from_pretrained(
-    str(MODEL_PATH)
-)
+# ============================================================
+# LOAD DISTILBERT
+# ============================================================
+#
+# LOCAL:
+#   If the model already exists in
+#   models/distilbert_truthlens, load it directly.
+#
+# RENDER / CLOUD:
+#   The large model weights are NOT stored in GitHub.
+#   If they are missing, download them from Hugging Face
+#   and store them in the local models directory.
+#
+# ============================================================
 
-model = AutoModelForSequenceClassification.from_pretrained(
-    str(MODEL_PATH)
-)
+print("=" * 70)
+print("Loading TruthLens DistilBERT...")
+print("Hugging Face repository:", HF_MODEL_REPO)
+print("Hugging Face subfolder:", HF_MODEL_SUBFOLDER)
+print("Local model path:", MODEL_PATH)
+
+LOCAL_CONFIG = MODEL_PATH / "config.json"
+LOCAL_WEIGHTS = MODEL_PATH / "model.safetensors"
+LOCAL_TOKENIZER = MODEL_PATH / "tokenizer.json"
+
+HF_TOKEN = os.getenv("HF_TOKEN") or None
+
+try:
+
+    # --------------------------------------------------------
+    # Check whether the model already exists locally
+    # --------------------------------------------------------
+
+    model_exists_locally = (
+        LOCAL_CONFIG.exists()
+        and LOCAL_WEIGHTS.exists()
+        and LOCAL_TOKENIZER.exists()
+    )
+
+    if model_exists_locally:
+
+        print("Local TruthLens model files found.")
+        print("Using local model:", MODEL_PATH)
+
+    else:
+
+        # ----------------------------------------------------
+        # Cloud deployment:
+        # Download model from Hugging Face.
+        # ----------------------------------------------------
+
+        print("Local TruthLens model not found.")
+        print("Downloading model from Hugging Face...")
+        print("Repository:", HF_MODEL_REPO)
+        print("Subfolder:", HF_MODEL_SUBFOLDER)
+
+        snapshot_download(
+            repo_id=HF_MODEL_REPO,
+            token=HF_TOKEN,
+            local_dir=str(BASE_DIR / "models"),
+            allow_patterns=[
+                f"{HF_MODEL_SUBFOLDER}/config.json",
+                f"{HF_MODEL_SUBFOLDER}/model.safetensors",
+                f"{HF_MODEL_SUBFOLDER}/tokenizer.json",
+                f"{HF_MODEL_SUBFOLDER}/tokenizer_config.json",
+            ],
+        )
+
+        print("TruthLens model download completed.")
+
+    # --------------------------------------------------------
+    # Verify required files
+    # --------------------------------------------------------
+
+    required_files = [
+        LOCAL_CONFIG,
+        LOCAL_WEIGHTS,
+        LOCAL_TOKENIZER,
+    ]
+
+    missing_files = [
+        str(file)
+        for file in required_files
+        if not file.exists()
+    ]
+
+    if missing_files:
+
+        raise FileNotFoundError(
+            "TruthLens model is incomplete. "
+            f"Missing files: {missing_files}"
+        )
+
+    # --------------------------------------------------------
+    # Load tokenizer from local downloaded files
+    # --------------------------------------------------------
+
+    print("Loading TruthLens tokenizer...")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(MODEL_PATH),
+        local_files_only=True,
+    )
+
+    # --------------------------------------------------------
+    # Load DistilBERT model from local downloaded files
+    # --------------------------------------------------------
+
+    print("Loading TruthLens DistilBERT weights...")
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        str(MODEL_PATH),
+        local_files_only=True,
+    )
+
+    print("DistilBERT loaded successfully.")
+    print("Model files:", MODEL_PATH)
+
+except Exception as error:
+
+    print("=" * 70)
+    print("FATAL ERROR: TruthLens DistilBERT could not be loaded.")
+    print("Error:", repr(error))
+    print("=" * 70)
+
+    raise
 
 model.to(DEVICE)
 model.eval()
-
-print("DistilBERT loaded successfully.")
 
 
 # ============================================================
