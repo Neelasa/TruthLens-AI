@@ -264,29 +264,63 @@ model.eval()
 # LOAD NLI
 # ============================================================
 
-print("-" * 70)
-print("Loading semantic verification model...")
-print("NLI model:", NLI_MODEL_NAME)
+# ============================================================
+# OPTIONAL NLI VERIFICATION MODEL
+# ============================================================
 
-nli_tokenizer = AutoTokenizer.from_pretrained(
-    NLI_MODEL_NAME
-)
+DISABLE_NLI = os.getenv("DISABLE_NLI", "false").lower() == "true"
 
-nli_model = AutoModelForSequenceClassification.from_pretrained(
-    NLI_MODEL_NAME
-)
+nli_tokenizer = None
+nli_model = None
+NLI_AVAILABLE = False
 
-nli_model.to(DEVICE)
-nli_model.eval()
+if DISABLE_NLI:
+    print("-" * 70)
+    print("NLI Verification: DISABLED")
+    print("Reason: low-memory deployment environment")
+else:
+    print("-" * 70)
+    print("Loading semantic verification model...")
+    print("NLI model:", NLI_MODEL_NAME)
 
-print("NLI model loaded successfully.")
+    try:
+        nli_tokenizer = AutoTokenizer.from_pretrained(
+            NLI_MODEL_NAME
+        )
 
+        nli_model = AutoModelForSequenceClassification.from_pretrained(
+            NLI_MODEL_NAME
+        )
 
+        nli_model.to(DEVICE)
+        nli_model.eval()
+
+        NLI_AVAILABLE = True
+
+        print("NLI model loaded successfully.")
+
+        print(
+            "NLI labels:",
+            nli_model.config.id2label
+        )
+
+    except Exception as error:
+        print("NLI model could not be loaded.")
+        print("NLI error:", repr(error))
+        print("Continuing without NLI verification.")
+
+        nli_tokenizer = None
+        nli_model = None
+        NLI_AVAILABLE = False
+        
 # ============================================================
 # NLI LABEL MAPPING
 # ============================================================
 
 def build_nli_label_ids():
+    if not NLI_AVAILABLE or nli_model is None:
+        return {}, None, None, None
+
     labels = {}
 
     for index, label in nli_model.config.id2label.items():
@@ -314,28 +348,30 @@ def build_nli_label_ids():
 ) = build_nli_label_ids()
 
 
-if (
-    NLI_ENTAILMENT_ID is None
-    or NLI_CONTRADICTION_ID is None
-    or NLI_NEUTRAL_ID is None
-):
-    if len(nli_model.config.id2label) == 3:
-        NLI_CONTRADICTION_ID = 0
-        NLI_NEUTRAL_ID = 1
-        NLI_ENTAILMENT_ID = 2
+if NLI_AVAILABLE:
+    if (
+        NLI_ENTAILMENT_ID is None
+        or NLI_CONTRADICTION_ID is None
+        or NLI_NEUTRAL_ID is None
+    ):
+        if len(nli_model.config.id2label) == 3:
+            NLI_CONTRADICTION_ID = 0
+            NLI_NEUTRAL_ID = 1
+            NLI_ENTAILMENT_ID = 2
 
-
-print("NLI labels:", NLI_LABEL_IDS)
-print(
-    "NLI IDs:",
-    {
-        "entailment": NLI_ENTAILMENT_ID,
-        "contradiction": NLI_CONTRADICTION_ID,
-        "neutral": NLI_NEUTRAL_ID,
-    },
-)
-
-
+    print("NLI labels:", NLI_LABEL_IDS)
+    print(
+        "NLI IDs:",
+        {
+            "entailment": NLI_ENTAILMENT_ID,
+            "contradiction": NLI_CONTRADICTION_ID,
+            "neutral": NLI_NEUTRAL_ID,
+        },
+    )
+else:
+    print("NLI labels: unavailable")
+    print("NLI IDs: unavailable")
+    
 # ============================================================
 # CANONICAL EVIDENCE
 # ============================================================
@@ -1513,15 +1549,28 @@ def deterministic_verification(
 # NLI
 # ============================================================
 
+
+
 def nli_verify(
     claim,
     evidence,
 ):
+    if not NLI_AVAILABLE or nli_model is None or nli_tokenizer is None:
+        return {
+            "status": "NEUTRAL",
+            "confidence": 0.0,
+            "supported_score": 0.0,
+            "contradicted_score": 0.0,
+            "neutral_score": 100.0,
+            "evidence_used": "",
+            "verification_method": "NLI_DISABLED",
+        }
+
     evidence_used = select_relevant_evidence(
         claim,
         evidence,
     )
-
+    
     if not evidence_used:
         return {
             "status": "NEUTRAL",
@@ -2256,8 +2305,10 @@ print("Wikipedia Search: ACTIVE")
 print("Wikipedia Evidence: ACTIVE")
 print("Canonical Evidence: ACTIVE")
 print("Deterministic Verification: ACTIVE")
-print("NLI Verification: ACTIVE")
-print("Source Reliability: ACTIVE")
+print(
+    "NLI Verification:",
+    "ACTIVE" if NLI_AVAILABLE else "DISABLED",
+)print("Source Reliability: ACTIVE")
 print("Evidence Quality: ACTIVE")
 print("India Classification Contradiction Guard: ACTIVE")
 print("=" * 70)
