@@ -180,181 +180,388 @@ print("=" * 70)
 # DISTILBERT MODEL LOADING
 # ============================================================
 
-LOCAL_CONFIG = (
-    MODEL_PATH
-    / "config.json"
+# Original full-precision model (kept for local fallback)
+MODEL_PATH = (
+    BASE_DIR
+    / "models"
+    / "distilbert_truthlens"
 )
 
-LOCAL_WEIGHTS = (
-    MODEL_PATH
-    / "model.safetensors"
+# Low-memory INT8 model
+INT8_MODEL_PATH = (
+    BASE_DIR
+    / "models"
+    / "distilbert_truthlens_int8"
 )
 
-LOCAL_TOKENIZER = (
-    MODEL_PATH
+INT8_MODEL_FILE = (
+    INT8_MODEL_PATH
+    / "quantized_model.pt"
+)
+
+INT8_TOKENIZER = (
+    INT8_MODEL_PATH
     / "tokenizer.json"
 )
 
-LOCAL_TOKENIZER_CONFIG = (
-    MODEL_PATH
+INT8_TOKENIZER_CONFIG = (
+    INT8_MODEL_PATH
     / "tokenizer_config.json"
 )
 
+# INT8 is enabled by default because the deployment target
+# (Render free instance) has a tight memory limit.
+#
+# To use the original full-precision model locally:
+#     $env:USE_INT8_MODEL="false"
+#
+# To use INT8:
+#     $env:USE_INT8_MODEL="true"
+USE_INT8_MODEL = (
+    os.getenv(
+        "USE_INT8_MODEL",
+        "true",
+    ).lower()
+    == "true"
+)
 
-def download_truthlens_model():
+print("-" * 70)
+print("Loading TruthLens DistilBERT...")
+print("INT8 model enabled:", USE_INT8_MODEL)
 
-    MODEL_PATH.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+try:
 
-    print("-" * 70)
-    print("Downloading TruthLens DistilBERT from Hugging Face...")
-    print("Repository:", HF_MODEL_REPO)
-    print("Subfolder:", HF_MODEL_SUBFOLDER)
+    # ========================================================
+    # INT8 MODEL
+    # ========================================================
 
-    hf_token = (
-        os.getenv("HF_TOKEN")
-        or None
-    )
+    if USE_INT8_MODEL:
 
-    files = [
-        "config.json",
-        "model.safetensors",
-        "tokenizer.json",
-        "tokenizer_config.json",
-    ]
+        print("-" * 70)
+        print("Using INT8 TruthLens model.")
+        print("INT8 model path:", INT8_MODEL_PATH)
 
-    for filename in files:
-
-        print(
-            "Downloading:",
-            filename,
+        INT8_MODEL_PATH.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-        downloaded_path = hf_hub_download(
-            repo_id=HF_MODEL_REPO,
-            filename=(
-                f"{HF_MODEL_SUBFOLDER}/{filename}"
-            ),
-            token=hf_token,
+        hf_token = (
+            os.getenv("HF_TOKEN")
+            or None
         )
 
-        source = Path(
-            downloaded_path
-        )
+        # ----------------------------------------------------
+        # Download INT8 weights when they are not local
+        # ----------------------------------------------------
 
-        destination = (
-            MODEL_PATH
-            / filename
-        )
+        if not INT8_MODEL_FILE.exists():
 
-        if source.resolve() != destination.resolve():
+            print("INT8 model not found locally.")
+            print("Downloading INT8 model from Hugging Face...")
+
+            downloaded_path = hf_hub_download(
+                repo_id=HF_MODEL_REPO,
+                filename=(
+                    "distilbert_truthlens_int8/"
+                    "quantized_model.pt"
+                ),
+                token=hf_token,
+            )
+
+            source = Path(downloaded_path)
+
+            INT8_MODEL_FILE.write_bytes(
+                source.read_bytes()
+            )
+
+            print(
+                "INT8 model downloaded:",
+                INT8_MODEL_FILE,
+            )
+
+        else:
+
+            print("Local INT8 model file found.")
+
+        # ----------------------------------------------------
+        # Download INT8 tokenizer files when needed
+        # ----------------------------------------------------
+
+        tokenizer_files = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ]
+
+        for filename in tokenizer_files:
+
+            destination = (
+                INT8_MODEL_PATH
+                / filename
+            )
+
+            if destination.exists():
+                continue
+
+            print(
+                "Downloading INT8 tokenizer file:",
+                filename,
+            )
+
+            downloaded_path = hf_hub_download(
+                repo_id=HF_MODEL_REPO,
+                filename=(
+                    "distilbert_truthlens_int8/"
+                    + filename
+                ),
+                token=hf_token,
+            )
+
+            source = Path(downloaded_path)
 
             destination.write_bytes(
                 source.read_bytes()
             )
 
+            print(
+                "Saved:",
+                destination,
+            )
+
+        # ----------------------------------------------------
+        # Load tokenizer
+        # ----------------------------------------------------
+
+        print("Loading INT8 tokenizer...")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(INT8_MODEL_PATH),
+            local_files_only=True,
+        )
+
+        # ----------------------------------------------------
+        # Load the already-quantized PyTorch model
+        # ----------------------------------------------------
+        #
+        # quantized_model.pt is expected to contain the complete
+        # quantized model object produced by quantize_model.py.
+        # It must stay on CPU because PyTorch dynamic INT8
+        # operators are CPU-oriented.
+        # ----------------------------------------------------
+
+        print("Loading INT8 TruthLens model...")
+
+        model = torch.load(
+            INT8_MODEL_FILE,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        model.eval()
+
         print(
-            "Saved:",
-            destination,
+            "INT8 TruthLens model loaded successfully."
         )
-
-    print(
-        "TruthLens model download completed."
-    )
-
-
-def ensure_truthlens_model():
-
-    MODEL_PATH.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    required = [
-        LOCAL_CONFIG,
-        LOCAL_WEIGHTS,
-        LOCAL_TOKENIZER,
-        LOCAL_TOKENIZER_CONFIG,
-    ]
-
-    if all(
-        file.exists()
-        for file in required
-    ):
 
         print(
-            "Local TruthLens model files found."
+            "INT8 model file:",
+            INT8_MODEL_FILE,
         )
 
-        return
-
-    print(
-        "Local TruthLens model not found."
-    )
-
-    download_truthlens_model()
-
-    missing = [
-        str(file)
-        for file in required
-        if not file.exists()
-    ]
-
-    if missing:
-
-        raise FileNotFoundError(
-            "TruthLens model download incomplete. "
-            f"Missing files: {missing}"
+        print(
+            "Model device: cpu"
         )
 
+    # ========================================================
+    # ORIGINAL FULL-PRECISION MODEL
+    # ========================================================
 
-# ============================================================
-# LOAD DISTILBERT
-# ============================================================
+    else:
 
-print("-" * 70)
-print("Loading TruthLens DistilBERT...")
+        print("-" * 70)
+        print("Using original full-precision DistilBERT model.")
 
-try:
+        LOCAL_CONFIG = (
+            MODEL_PATH
+            / "config.json"
+        )
 
-    ensure_truthlens_model()
+        LOCAL_WEIGHTS = (
+            MODEL_PATH
+            / "model.safetensors"
+        )
 
-    print(
-        "Loading TruthLens tokenizer..."
-    )
+        LOCAL_TOKENIZER = (
+            MODEL_PATH
+            / "tokenizer.json"
+        )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(MODEL_PATH),
-        local_files_only=True,
-    )
+        LOCAL_TOKENIZER_CONFIG = (
+            MODEL_PATH
+            / "tokenizer_config.json"
+        )
 
-    print(
-        "Loading TruthLens DistilBERT weights..."
-    )
+        def download_truthlens_model():
 
-    model = (
-        AutoModelForSequenceClassification
-        .from_pretrained(
+            MODEL_PATH.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            print("-" * 70)
+            print(
+                "Downloading TruthLens DistilBERT "
+                "from Hugging Face..."
+            )
+
+            print(
+                "Repository:",
+                HF_MODEL_REPO,
+            )
+
+            print(
+                "Subfolder:",
+                HF_MODEL_SUBFOLDER,
+            )
+
+            hf_token = (
+                os.getenv("HF_TOKEN")
+                or None
+            )
+
+            files = [
+                "config.json",
+                "model.safetensors",
+                "tokenizer.json",
+                "tokenizer_config.json",
+            ]
+
+            for filename in files:
+
+                print(
+                    "Downloading:",
+                    filename,
+                )
+
+                downloaded_path = hf_hub_download(
+                    repo_id=HF_MODEL_REPO,
+                    filename=(
+                        f"{HF_MODEL_SUBFOLDER}/"
+                        f"{filename}"
+                    ),
+                    token=hf_token,
+                )
+
+                source = Path(downloaded_path)
+
+                destination = (
+                    MODEL_PATH
+                    / filename
+                )
+
+                if (
+                    source.resolve()
+                    != destination.resolve()
+                ):
+
+                    destination.write_bytes(
+                        source.read_bytes()
+                    )
+
+                print(
+                    "Saved:",
+                    destination,
+                )
+
+            print(
+                "TruthLens model download completed."
+            )
+
+        def ensure_truthlens_model():
+
+            MODEL_PATH.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            required = [
+                LOCAL_CONFIG,
+                LOCAL_WEIGHTS,
+                LOCAL_TOKENIZER,
+                LOCAL_TOKENIZER_CONFIG,
+            ]
+
+            if all(
+                file.exists()
+                for file in required
+            ):
+
+                print(
+                    "Local TruthLens model files found."
+                )
+
+                return
+
+            print(
+                "Local TruthLens model not found."
+            )
+
+            download_truthlens_model()
+
+            missing = [
+                str(file)
+                for file in required
+                if not file.exists()
+            ]
+
+            if missing:
+
+                raise FileNotFoundError(
+                    "TruthLens model download incomplete. "
+                    f"Missing files: {missing}"
+                )
+
+        ensure_truthlens_model()
+
+        print(
+            "Loading TruthLens tokenizer..."
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(
             str(MODEL_PATH),
             local_files_only=True,
-            use_safetensors=True,
         )
-    )
 
-    model.to(DEVICE)
+        print(
+            "Loading TruthLens DistilBERT weights..."
+        )
 
-    model.eval()
+        model = (
+            AutoModelForSequenceClassification
+            .from_pretrained(
+                str(MODEL_PATH),
+                local_files_only=True,
+                use_safetensors=True,
+            )
+        )
 
-    print(
-        "DistilBERT loaded successfully."
-    )
+        model.to(DEVICE)
 
-    print(
-        "Model files:",
-        MODEL_PATH,
-    )
+        model.eval()
+
+        print(
+            "DistilBERT loaded successfully."
+        )
+
+        print(
+            "Model files:",
+            MODEL_PATH,
+        )
+
+        print(
+            "Device:",
+            DEVICE,
+        )
 
 except Exception as error:
 
