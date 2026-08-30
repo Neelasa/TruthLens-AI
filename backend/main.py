@@ -2,19 +2,17 @@ from pathlib import Path
 import os
 import re
 import time
+import json
 import requests
-import torch
+
+import numpy as np
+import onnxruntime as ort
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-)
-
-from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
 
 
 # ============================================================
@@ -97,11 +95,9 @@ HF_MODEL_REPO = os.getenv(
 
 HF_MODEL_SUBFOLDER = "distilbert_truthlens"
 
-DEVICE = torch.device(
-    "cuda"
-    if torch.cuda.is_available()
-    else "cpu"
-)
+# ONNX Runtime deployment is CPU-only.
+# PyTorch is imported only if optional NLI verification is enabled.
+DEVICE = "cpu"
 
 WIKIPEDIA_API = (
     "https://en.wikipedia.org/w/api.php"
@@ -177,417 +173,145 @@ print("=" * 70)
 
 
 # ============================================================
-# DISTILBERT MODEL LOADING
+# DISTILBERT MODEL LOADING - INT8 ONNX
+# ============================================================
+#
+# The deployment model is the tested 64 MB INT8 ONNX model:
+#
+#   models/distilbert_truthlens_onnx/model.int8.onnx
+#
+# ONNX Runtime is used instead of PyTorch for the main model so
+# the backend remains suitable for a small CPU-only deployment.
+#
+# NLI remains optional and disabled by default.
 # ============================================================
 
-# Original full-precision model (kept for local fallback)
 MODEL_PATH = (
     BASE_DIR
     / "models"
     / "distilbert_truthlens"
 )
 
-# Low-memory INT8 model
-INT8_MODEL_PATH = (
+ONNX_MODEL_PATH = (
     BASE_DIR
     / "models"
-    / "distilbert_truthlens_int8"
+    / "distilbert_truthlens_onnx"
 )
 
-INT8_MODEL_FILE = (
-    INT8_MODEL_PATH
-    / "quantized_model.pt"
+ONNX_MODEL_FILE = (
+    ONNX_MODEL_PATH
+    / "model.int8.onnx"
 )
 
-INT8_TOKENIZER = (
-    INT8_MODEL_PATH
+ONNX_TOKENIZER_FILE = (
+    ONNX_MODEL_PATH
     / "tokenizer.json"
 )
 
-INT8_TOKENIZER_CONFIG = (
-    INT8_MODEL_PATH
+ONNX_TOKENIZER_CONFIG = (
+    ONNX_MODEL_PATH
     / "tokenizer_config.json"
 )
 
-# INT8 is enabled by default because the deployment target
-# (Render free instance) has a tight memory limit.
-#
-# To use the original full-precision model locally:
-#     $env:USE_INT8_MODEL="false"
-#
-# To use INT8:
-#     $env:USE_INT8_MODEL="true"
-USE_INT8_MODEL = (
-    os.getenv(
-        "USE_INT8_MODEL",
-        "true",
-    ).lower()
-    == "true"
+DEVICE = "cpu"
+
+# Keep the process conservative for free/small CPU instances.
+os.environ.setdefault(
+    "OMP_NUM_THREADS",
+    "1",
 )
 
-# Keep CPU thread usage conservative on small deployment instances.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-try:
-    torch.set_num_threads(1)
-except Exception:
-    pass
+os.environ.setdefault(
+    "MKL_NUM_THREADS",
+    "1",
+)
 
 print("-" * 70)
-print("Loading TruthLens DistilBERT...")
-print("INT8 model enabled:", USE_INT8_MODEL)
-
-try:
-
-    # ========================================================
-    # INT8 MODEL
-    # ========================================================
-
-    if USE_INT8_MODEL:
-
-        print("-" * 70)
-        print("Using INT8 TruthLens model.")
-        print("INT8 model path:", INT8_MODEL_PATH)
-
-        INT8_MODEL_PATH.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        hf_token = (
-            os.getenv("HF_TOKEN")
-            or None
-        )
-
-        # ----------------------------------------------------
-        # Download INT8 weights when they are not local
-        # ----------------------------------------------------
-
-        if not INT8_MODEL_FILE.exists():
-
-            print("INT8 model not found locally.")
-            print("Downloading INT8 model from Hugging Face...")
-
-            downloaded_path = hf_hub_download(
-                repo_id=HF_MODEL_REPO,
-                filename=(
-                    "distilbert_truthlens_int8/"
-                    "quantized_model.pt"
-                ),
-                token=hf_token,
-            )
-
-            source = Path(downloaded_path)
-
-            INT8_MODEL_FILE.write_bytes(
-                source.read_bytes()
-            )
-
-            print(
-                "INT8 model downloaded:",
-                INT8_MODEL_FILE,
-            )
-
-        else:
-
-            print("Local INT8 model file found.")
-
-        # ----------------------------------------------------
-        # Download INT8 tokenizer files when needed
-        # ----------------------------------------------------
-
-        tokenizer_files = [
-            "tokenizer.json",
-            "tokenizer_config.json",
-        ]
-
-        for filename in tokenizer_files:
-
-            destination = (
-                INT8_MODEL_PATH
-                / filename
-            )
-
-            if destination.exists():
-                continue
-
-            print(
-                "Downloading INT8 tokenizer file:",
-                filename,
-            )
-
-            downloaded_path = hf_hub_download(
-                repo_id=HF_MODEL_REPO,
-                filename=(
-                    "distilbert_truthlens_int8/"
-                    + filename
-                ),
-                token=hf_token,
-            )
-
-            source = Path(downloaded_path)
-
-            destination.write_bytes(
-                source.read_bytes()
-            )
-
-            print(
-                "Saved:",
-                destination,
-            )
-
-        # ----------------------------------------------------
-        # Load tokenizer
-        # ----------------------------------------------------
-
-        print("Loading INT8 tokenizer...")
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(INT8_MODEL_PATH),
-            local_files_only=True,
-        )
-
-        # ----------------------------------------------------
-        # Load the already-quantized PyTorch model
-        # ----------------------------------------------------
-        #
-        # quantized_model.pt is expected to contain the complete
-        # quantized model object produced by quantize_model.py.
-        # It must stay on CPU because PyTorch dynamic INT8
-        # operators are CPU-oriented.
-        # ----------------------------------------------------
-
-        print("Loading INT8 TruthLens model...")
-
-        model = torch.load(
-            INT8_MODEL_FILE,
-            map_location="cpu",
-            weights_only=False,
-        )
-
-        model.eval()
-
-        print(
-            "INT8 TruthLens model loaded successfully."
-        )
-
-        print(
-            "INT8 model file:",
-            INT8_MODEL_FILE,
-        )
-
-        print(
-            "Model device: cpu"
-        )
-
-    # ========================================================
-    # ORIGINAL FULL-PRECISION MODEL
-    # ========================================================
-
-    else:
-
-        print("-" * 70)
-        print("Using original full-precision DistilBERT model.")
-
-        LOCAL_CONFIG = (
-            MODEL_PATH
-            / "config.json"
-        )
-
-        LOCAL_WEIGHTS = (
-            MODEL_PATH
-            / "model.safetensors"
-        )
-
-        LOCAL_TOKENIZER = (
-            MODEL_PATH
-            / "tokenizer.json"
-        )
-
-        LOCAL_TOKENIZER_CONFIG = (
-            MODEL_PATH
-            / "tokenizer_config.json"
-        )
-
-        def download_truthlens_model():
-
-            MODEL_PATH.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            print("-" * 70)
-            print(
-                "Downloading TruthLens DistilBERT "
-                "from Hugging Face..."
-            )
-
-            print(
-                "Repository:",
-                HF_MODEL_REPO,
-            )
-
-            print(
-                "Subfolder:",
-                HF_MODEL_SUBFOLDER,
-            )
-
-            hf_token = (
-                os.getenv("HF_TOKEN")
-                or None
-            )
-
-            files = [
-                "config.json",
-                "model.safetensors",
-                "tokenizer.json",
-                "tokenizer_config.json",
-            ]
-
-            for filename in files:
-
-                print(
-                    "Downloading:",
-                    filename,
-                )
-
-                downloaded_path = hf_hub_download(
-                    repo_id=HF_MODEL_REPO,
-                    filename=(
-                        f"{HF_MODEL_SUBFOLDER}/"
-                        f"{filename}"
-                    ),
-                    token=hf_token,
-                )
-
-                source = Path(downloaded_path)
-
-                destination = (
-                    MODEL_PATH
-                    / filename
-                )
-
-                if (
-                    source.resolve()
-                    != destination.resolve()
-                ):
-
-                    destination.write_bytes(
-                        source.read_bytes()
-                    )
-
-                print(
-                    "Saved:",
-                    destination,
-                )
-
-            print(
-                "TruthLens model download completed."
-            )
-
-        def ensure_truthlens_model():
-
-            MODEL_PATH.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            required = [
-                LOCAL_CONFIG,
-                LOCAL_WEIGHTS,
-                LOCAL_TOKENIZER,
-                LOCAL_TOKENIZER_CONFIG,
-            ]
-
-            if all(
-                file.exists()
-                for file in required
-            ):
-
-                print(
-                    "Local TruthLens model files found."
-                )
-
-                return
-
-            print(
-                "Local TruthLens model not found."
-            )
-
-            download_truthlens_model()
-
-            missing = [
-                str(file)
-                for file in required
-                if not file.exists()
-            ]
-
-            if missing:
-
-                raise FileNotFoundError(
-                    "TruthLens model download incomplete. "
-                    f"Missing files: {missing}"
-                )
-
-        ensure_truthlens_model()
-
-        print(
-            "Loading TruthLens tokenizer..."
-        )
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(MODEL_PATH),
-            local_files_only=True,
-        )
-
-        print(
-            "Loading TruthLens DistilBERT weights..."
-        )
-
-        model = (
-            AutoModelForSequenceClassification
-            .from_pretrained(
-                str(MODEL_PATH),
-                local_files_only=True,
-                use_safetensors=True,
-            )
-        )
-
-        model.to(DEVICE)
-
-        model.eval()
-
-        print(
-            "DistilBERT loaded successfully."
-        )
-
-        print(
-            "Model files:",
-            MODEL_PATH,
-        )
-
-        print(
-            "Device:",
-            DEVICE,
-        )
-
-except Exception as error:
-
-    print("=" * 70)
-    print(
-        "FATAL ERROR: TruthLens DistilBERT "
-        "could not be loaded."
+print("Loading TruthLens AI INT8 ONNX model...")
+print("ONNX model path:", ONNX_MODEL_FILE)
+print("Device:", DEVICE)
+
+if not ONNX_MODEL_FILE.exists():
+
+    raise FileNotFoundError(
+        "INT8 ONNX model not found: "
+        f"{ONNX_MODEL_FILE}"
     )
 
-    print(
-        "Error:",
-        repr(error),
+if not ONNX_TOKENIZER_FILE.exists():
+
+    raise FileNotFoundError(
+        "ONNX tokenizer.json not found: "
+        f"{ONNX_TOKENIZER_FILE}"
     )
 
-    print("=" * 70)
+if not ONNX_TOKENIZER_CONFIG.exists():
 
-    raise
+    raise FileNotFoundError(
+        "ONNX tokenizer_config.json not found: "
+        f"{ONNX_TOKENIZER_CONFIG}"
+    )
 
+print("Loading ONNX tokenizer...")
+
+tokenizer = AutoTokenizer.from_pretrained(
+    str(ONNX_MODEL_PATH),
+    local_files_only=True,
+)
+
+print("ONNX tokenizer loaded successfully.")
+
+print("Loading INT8 ONNX Runtime session...")
+
+session_options = ort.SessionOptions()
+
+session_options.intra_op_num_threads = 1
+session_options.inter_op_num_threads = 1
+session_options.graph_optimization_level = (
+    ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+)
+
+onnx_session = ort.InferenceSession(
+    str(ONNX_MODEL_FILE),
+    sess_options=session_options,
+    providers=[
+        "CPUExecutionProvider",
+    ],
+)
+
+ONNX_INPUT_NAMES = {
+    item.name
+    for item in onnx_session.get_inputs()
+}
+
+ONNX_OUTPUT_NAMES = [
+    item.name
+    for item in onnx_session.get_outputs()
+]
+
+print(
+    "ONNX inputs:",
+    sorted(ONNX_INPUT_NAMES),
+)
+
+print(
+    "ONNX outputs:",
+    ONNX_OUTPUT_NAMES,
+)
+
+print(
+    "INT8 ONNX model loaded successfully."
+)
+
+print(
+    "INT8 ONNX model size:",
+    round(
+        ONNX_MODEL_FILE.stat().st_size
+        / (1024 * 1024),
+        2,
+    ),
+    "MB",
+)
 
 # ============================================================
 # OPTIONAL NLI MODEL
@@ -645,6 +369,13 @@ else:
     )
 
     try:
+
+        # Import PyTorch/AutoModel only when NLI is explicitly
+        # enabled. This keeps the default deployment lightweight.
+        import torch
+        from transformers import (
+            AutoModelForSequenceClassification,
+        )
 
         nli_tokenizer = (
             AutoTokenizer.from_pretrained(
@@ -3191,6 +2922,10 @@ def nli_verify(
 
     try:
 
+        # PyTorch is imported lazily because NLI is disabled by
+        # default on low-memory deployments.
+        import torch
+
         inputs = nli_tokenizer(
             evidence_used,
             claim,
@@ -3378,7 +3113,7 @@ def verify_claim_against_evidence(
 
 
 # ============================================================
-# DISTILBERT ASSESSMENT
+# DISTILBERT ASSESSMENT - INT8 ONNX
 # ============================================================
 
 def run_model_assessment(
@@ -3387,67 +3122,176 @@ def run_model_assessment(
 
     try:
 
-        inputs = tokenizer(
+        encoded = tokenizer(
             content,
-            return_tensors="pt",
+            return_tensors="np",
             truncation=True,
             padding=True,
             max_length=128,
         )
 
-        inputs = {
-            key: value.to(
-                DEVICE
-            )
-            for key, value
-            in inputs.items()
-        }
+        inputs = {}
 
-        with torch.no_grad():
+        if "input_ids" in ONNX_INPUT_NAMES:
 
-            outputs = model(
-                **inputs
-            )
-
-            probabilities = (
-                torch.softmax(
-                    outputs.logits,
-                    dim=-1,
+            inputs["input_ids"] = (
+                np.asarray(
+                    encoded["input_ids"],
+                    dtype=np.int64,
                 )
             )
 
-            predicted_id = int(
-                torch.argmax(
-                    probabilities,
-                    dim=-1,
-                ).item()
-            )
+        if "attention_mask" in ONNX_INPUT_NAMES:
 
-            confidence = (
-                float(
-                    probabilities[
-                        0,
-                        predicted_id,
-                    ].item()
+            inputs["attention_mask"] = (
+                np.asarray(
+                    encoded["attention_mask"],
+                    dtype=np.int64,
                 )
-                * 100
             )
 
-        label_map = getattr(
-            model.config,
-            "id2label",
-            {},
+        if "token_type_ids" in ONNX_INPUT_NAMES:
+
+            if "token_type_ids" in encoded:
+
+                inputs["token_type_ids"] = (
+                    np.asarray(
+                        encoded["token_type_ids"],
+                        dtype=np.int64,
+                    )
+                )
+
+            else:
+
+                inputs["token_type_ids"] = (
+                    np.zeros_like(
+                        encoded["input_ids"],
+                        dtype=np.int64,
+                    )
+                )
+
+        outputs = onnx_session.run(
+            None,
+            inputs,
         )
 
-        label = label_map.get(
-            predicted_id,
-            str(predicted_id),
+        if not outputs:
+
+            raise RuntimeError(
+                "ONNX model returned no outputs."
+            )
+
+        logits = np.asarray(
+            outputs[0],
+            dtype=np.float32,
         )
+
+        if logits.ndim == 1:
+
+            logits = logits.reshape(
+                1,
+                -1,
+            )
+
+        if logits.ndim != 2:
+
+            raise RuntimeError(
+                "Unexpected ONNX logits shape: "
+                f"{logits.shape}"
+            )
+
+        # Numerically stable softmax.
+        shifted = (
+            logits
+            - np.max(
+                logits,
+                axis=-1,
+                keepdims=True,
+            )
+        )
+
+        exp_logits = np.exp(
+            shifted
+        )
+
+        probabilities = (
+            exp_logits
+            /
+            np.sum(
+                exp_logits,
+                axis=-1,
+                keepdims=True,
+            )
+        )
+
+        predicted_id = int(
+            np.argmax(
+                probabilities[0]
+            )
+        )
+
+        confidence = (
+            float(
+                probabilities[
+                    0,
+                    predicted_id,
+                ]
+            )
+            * 100.0
+        )
+
+        # Read the trained model's label mapping from config.json.
+        label = str(
+            predicted_id
+        )
+
+        config_file = (
+            ONNX_MODEL_PATH
+            / "config.json"
+        )
+
+        if config_file.exists():
+
+            try:
+
+                with open(
+                    config_file,
+                    "r",
+                    encoding="utf-8",
+                ) as file:
+
+                    config = json.load(
+                        file
+                    )
+
+                id2label = (
+                    config.get(
+                        "id2label",
+                        {},
+                    )
+                )
+
+                label = str(
+                    id2label.get(
+                        str(predicted_id),
+                        id2label.get(
+                            predicted_id,
+                            label,
+                        ),
+                    )
+                )
+
+            except Exception as error:
+
+                print(
+                    "Could not read ONNX label map:",
+                    repr(error),
+                )
 
         return {
 
             "verdict":
-                str(label),
+                label,
 
             "confidence":
                 round(
@@ -3457,12 +3301,16 @@ def run_model_assessment(
 
             "model":
                 "DistilBERT",
+
+            "runtime":
+                "ONNX Runtime INT8",
+
         }
 
     except Exception as error:
 
         print(
-            "DistilBERT assessment failed:",
+            "DistilBERT ONNX assessment failed:",
             repr(error),
         )
 
@@ -3476,6 +3324,10 @@ def run_model_assessment(
 
             "model":
                 "DistilBERT",
+
+            "runtime":
+                "ONNX Runtime INT8",
+
         }
 
 
@@ -3978,7 +3830,7 @@ def diagnostics():
             str(DEVICE),
 
         "distilbert_loaded":
-            model is not None,
+            onnx_session is not None,
 
         "nli_loaded":
             NLI_AVAILABLE
@@ -4073,7 +3925,7 @@ def health_check():
             "healthy",
 
         "model_loaded":
-            model is not None,
+            onnx_session is not None,
 
         "nli_loaded":
             NLI_AVAILABLE,
@@ -4363,9 +4215,14 @@ print(
 print(
     "DistilBERT:",
     "ACTIVE"
-    if model is not None
+    if onnx_session is not None
     else
     "INACTIVE",
+)
+
+print(
+    "Model Runtime:",
+    "ONNX Runtime INT8",
 )
 
 print(

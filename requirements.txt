@@ -2,8 +2,11 @@ fastapi
 uvicorn[standard]
 pydantic
 requests
-torch
+httpx
+numpy
+onnxruntime
 transformers
+tokenizers
 pillow
 pytesseract
 python-multipart
