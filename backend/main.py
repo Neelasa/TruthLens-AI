@@ -225,6 +225,14 @@ USE_INT8_MODEL = (
     == "true"
 )
 
+# Keep CPU thread usage conservative on small deployment instances.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
+
 print("-" * 70)
 print("Loading TruthLens DistilBERT...")
 print("INT8 model enabled:", USE_INT8_MODEL)
@@ -585,12 +593,14 @@ except Exception as error:
 # OPTIONAL NLI MODEL
 # ============================================================
 
+# Disable NLI by default for low-memory deployments (for example,
+# Render free-tier instances). Set DISABLE_NLI=false only when
+# sufficient memory is available.
 DISABLE_NLI = (
     os.getenv(
         "DISABLE_NLI",
-        "false",
-    )
-    .lower()
+        "true",
+    ).lower()
     == "true"
 )
 
