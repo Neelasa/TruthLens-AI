@@ -1,9 +1,30 @@
 // ============================================================
-// TruthLens AI - Step 11
-// Explainability + Confidence + Evidence Visualization
+// TruthLens AI - Frontend JavaScript
 // ============================================================
 
-const API_URL = "http://127.0.0.1:8000";
+// ============================================================
+// API CONFIGURATION
+// ============================================================
+//
+// LOCAL:
+//   http://127.0.0.1:8000
+//
+// VERCEL:
+//   https://truthlens-ai-backend-mtf8.onrender.com
+//
+// The frontend automatically selects the correct backend.
+// ============================================================
+
+const API_URL =
+    window.location.hostname === "localhost" ||
+    window.location.hostname === "127.0.0.1"
+        ? "http://127.0.0.1:8000"
+        : "https://truthlens-ai-backend-mtf8.onrender.com";
+
+
+// ============================================================
+// DOM ELEMENTS
+// ============================================================
 
 const contentInput = document.getElementById("contentInput");
 const analyzeButton = document.getElementById("analyzeButton");
@@ -29,7 +50,7 @@ function escapeHtml(value) {
 
 
 // ============================================================
-// FORMATTING
+// NUMBER / STATUS HELPERS
 // ============================================================
 
 function safeNumber(value) {
@@ -118,7 +139,7 @@ function getFinalConfidence(data) {
 
 
 // ============================================================
-// VERDICT DESIGN
+// VERDICT SETTINGS
 // ============================================================
 
 function getVerdictSettings(verdict) {
@@ -635,11 +656,6 @@ function renderVerificationBreakdown(data) {
 // EXPLAINABILITY
 // ============================================================
 
-// ============================================================
-// EXPLAINABILITY - STEP 12
-// AI + Evidence Reconciliation
-// ============================================================
-
 function generateExplanation(data, verdict) {
 
     const model =
@@ -690,19 +706,11 @@ function generateExplanation(data, verdict) {
         );
 
 
-    // --------------------------------------------------------
-    // BACKEND BASIS
-    // --------------------------------------------------------
-
     const backendBasis =
         finalAssessment.basis
             ? String(finalAssessment.basis).trim()
             : "";
 
-
-    // --------------------------------------------------------
-    // MODEL VERDICT
-    // --------------------------------------------------------
 
     const modelVerdict =
         cleanStatus(
@@ -710,20 +718,12 @@ function generateExplanation(data, verdict) {
         );
 
 
-    // --------------------------------------------------------
-    // EVIDENCE STATUS
-    // --------------------------------------------------------
-
     const evidenceStatus =
         cleanStatus(
             evidence.status ||
             "EVIDENCE_UNAVAILABLE"
         );
 
-
-    // --------------------------------------------------------
-    // SOURCE SUMMARY
-    // --------------------------------------------------------
 
     const sourceCount =
         sources.length;
@@ -734,10 +734,6 @@ function generateExplanation(data, verdict) {
             ? `TruthLens retrieved ${sourceCount} external evidence source${sourceCount === 1 ? "" : "s"} for verification.`
             : "TruthLens did not retrieve usable external evidence.";
 
-
-    // --------------------------------------------------------
-    // SEMANTIC VERIFICATION
-    // --------------------------------------------------------
 
     let verificationSummary = "";
 
@@ -771,29 +767,17 @@ function generateExplanation(data, verdict) {
     }
 
 
-    // --------------------------------------------------------
-    // MODEL SUMMARY
-    // --------------------------------------------------------
-
     const modelSummary =
         `The AI model initially assessed the claim as ${modelVerdict} with ${formatConfidence(
             modelConfidence
         )} confidence.`;
 
 
-    // --------------------------------------------------------
-    // EVIDENCE SUMMARY
-    // --------------------------------------------------------
-
     const evidenceSummary =
         `External evidence was assessed as ${evidenceStatus} with an evidence strength of ${formatConfidence(
             evidenceScore
         )}.`;
 
-
-    // --------------------------------------------------------
-    // DECISION RECONCILIATION
-    // --------------------------------------------------------
 
     let reconciliation = "";
 
@@ -843,10 +827,6 @@ function generateExplanation(data, verdict) {
     }
 
 
-    // --------------------------------------------------------
-    // FINAL EXPLANATION
-    // --------------------------------------------------------
-
     let explanation = "";
 
 
@@ -890,10 +870,6 @@ function generateExplanation(data, verdict) {
     }
 
 
-    // --------------------------------------------------------
-    // RETURN
-    // --------------------------------------------------------
-
     return {
 
         explanation,
@@ -933,10 +909,6 @@ function generateExplanation(data, verdict) {
 // EXPLAINABILITY CARD
 // ============================================================
 
-// ============================================================
-// EXPLAINABILITY CARD - STEP 12
-// ============================================================
-
 function renderExplainability(data, verdict) {
 
     const explanation =
@@ -956,8 +928,6 @@ function renderExplainability(data, verdict) {
             border-blue-500/20
             text-left
         ">
-
-            <!-- HEADER -->
 
             <div class="
                 flex
@@ -1018,10 +988,6 @@ function renderExplainability(data, verdict) {
             </div>
 
 
-            <!-- ================================================= -->
-            <!-- DECISION RECONCILIATION -->
-            <!-- ================================================= -->
-
             <div class="
                 mt-6
                 p-5
@@ -1062,10 +1028,6 @@ function renderExplainability(data, verdict) {
 
             </div>
 
-
-            <!-- ================================================= -->
-            <!-- REASONING STEPS -->
-            <!-- ================================================= -->
 
             <div class="
                 mt-6
@@ -1343,10 +1305,6 @@ function renderExplainability(data, verdict) {
             </div>
 
 
-            <!-- ================================================= -->
-            <!-- BACKEND BASIS -->
-            <!-- ================================================= -->
-
             ${
                 explanation.backendBasis
                     ? `
@@ -1387,6 +1345,7 @@ function renderExplainability(data, verdict) {
         </div>
     `;
 }
+
 
 // ============================================================
 // BEST EVIDENCE
@@ -1867,9 +1826,7 @@ function renderResult(data) {
 
     resultContent.innerHTML = `
 
-        <!-- ================================================= -->
         <!-- FINAL VERDICT -->
-        <!-- ================================================= -->
 
         <div class="
             p-7
@@ -1948,9 +1905,7 @@ function renderResult(data) {
         </div>
 
 
-        <!-- ================================================= -->
         <!-- CONFIDENCE -->
-        <!-- ================================================= -->
 
         ${renderConfidenceVisualization(
             data,
@@ -1958,16 +1913,12 @@ function renderResult(data) {
         )}
 
 
-        <!-- ================================================= -->
         <!-- VERIFICATION -->
-        <!-- ================================================= -->
 
         ${renderVerificationBreakdown(data)}
 
 
-        <!-- ================================================= -->
         <!-- ANALYZED CONTENT -->
-        <!-- ================================================= -->
 
         <div class="
             mt-5
@@ -2002,9 +1953,7 @@ function renderResult(data) {
         </div>
 
 
-        <!-- ================================================= -->
         <!-- MODEL + EVIDENCE -->
-        <!-- ================================================= -->
 
         <div class="
             grid
@@ -2120,9 +2069,7 @@ function renderResult(data) {
         </div>
 
 
-        <!-- ================================================= -->
         <!-- EXPLAINABILITY -->
-        <!-- ================================================= -->
 
         ${renderExplainability(
             data,
@@ -2130,18 +2077,14 @@ function renderResult(data) {
         )}
 
 
-        <!-- ================================================= -->
         <!-- BEST EVIDENCE -->
-        <!-- ================================================= -->
 
         ${renderBestEvidence(
             bestEvidence
         )}
 
 
-        <!-- ================================================= -->
         <!-- SOURCES -->
-        <!-- ================================================= -->
 
         ${renderSources(
             sources
@@ -2165,7 +2108,7 @@ function renderResult(data) {
 
 
 // ============================================================
-// HISTORY
+// VERIFICATION HISTORY
 // ============================================================
 
 const HISTORY_STORAGE_KEY =
