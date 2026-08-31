@@ -3,7 +3,12 @@
 // Explainability + Confidence + Evidence Visualization
 // ============================================================
 
-const API_URL = "http://127.0.0.1:8000";
+//const API_URL = "http://127.0.0.1:8000";
+const API_URL =
+    window.location.hostname === "localhost" ||
+    window.location.hostname === "127.0.0.1"
+        ? "http://127.0.0.1:8000"
+        : "https://truthlens-ai-backend-mtf8.onrender.com";
 
 const contentInput = document.getElementById("contentInput");
 const analyzeButton = document.getElementById("analyzeButton");
