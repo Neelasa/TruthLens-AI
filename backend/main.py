@@ -1,63 +1,59 @@
+"""
+TruthLens AI Backend
+Version 8.2.0
+
+Evidence-first, dynamic misinformation analysis.
+
+Design:
+- DistilBERT INT8 ONNX = initial ML signal only.
+- Dynamic evidence retrieval = Wikipedia + Wikidata + optional web search.
+- Deterministic verifier = fast generic contradiction/support checks.
+- Optional NLI = semantic claim/evidence verification when DISABLE_NLI=false.
+- Evidence consensus = final verdict is based on evidence, not DistilBERT alone.
+
+Optional environment variables:
+    DISABLE_NLI=true|false
+    SERPER_API_KEY=<optional>
+    TAVILY_API_KEY=<optional>
+
+The backend remains usable without either web-search API key.
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
+from datetime import datetime, timezone
+from urllib.parse import quote
+import json
 import os
 import re
 import time
-import json
-import requests
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import onnxruntime as ort
+import requests
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
 from transformers import AutoTokenizer
-
-
-# ============================================================
-# TruthLens AI Backend
-# Version 7.3.2
-#
-# Evidence-First Misinformation Analysis
-#
-# Components:
-#   1. DistilBERT initial assessment
-#   2. Canonical evidence
-#   3. Wikipedia search
-#   4. Wikipedia page retrieval
-#   5. Evidence relevance ranking
-#   6. Deterministic verification
-#   7. Optional NLI verification
-#   8. Source reliability
-#   9. Evidence quality
-#  10. Evidence-first final decision
-#
-# IMPORTANT:
-# NLI can be disabled on low-memory deployments:
-#
-#     DISABLE_NLI=true
-#
-# ============================================================
 
 
 # ============================================================
 # APPLICATION
 # ============================================================
 
+APP_VERSION = "8.2.0"
+
 app = FastAPI(
     title="TruthLens AI",
     description=(
-        "AI-Powered Misinformation Analysis "
-        "and Evidence-Based Decision Support System"
+        "AI-powered misinformation analysis and "
+        "evidence-based decision support system."
     ),
-    version="7.3.2",
+    version=APP_VERSION,
 )
-
-
-# ============================================================
-# CORS
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,80 +73,59 @@ class AnalyzeRequest(BaseModel):
 
 
 # ============================================================
-# PATHS / CONFIGURATION
+# PATHS / CONFIG
 # ============================================================
 
+#BASE_DIR = Path(__file__).resolve().parent.parent
+#BASE_DIR = Path(__file__).resolve().parent
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-MODEL_PATH = (
-    BASE_DIR
-    / "models"
-    / "distilbert_truthlens"
-)
+ONNX_MODEL_PATH = BASE_DIR / "models" / "distilbert_truthlens_onnx"
+ONNX_MODEL_FILE = ONNX_MODEL_PATH / "model.int8.onnx"
 
-HF_MODEL_REPO = os.getenv(
-    "HF_MODEL_REPO",
-    "neelu4304/TruthLensAI-distilbert",
-)
+WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
+WIKIDATA_API = "https://www.wikidata.org/w/api.php"
+WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
 
-HF_MODEL_SUBFOLDER = "distilbert_truthlens"
-
-# ONNX Runtime deployment is CPU-only.
-# PyTorch is imported only if optional NLI verification is enabled.
 DEVICE = "cpu"
 
-WIKIPEDIA_API = (
-    "https://en.wikipedia.org/w/api.php"
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.20"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+
+DISABLE_NLI = (
+    os.getenv("DISABLE_NLI", "true").strip().lower() == "true"
 )
 
-NLI_MODEL_NAME = (
-    "cross-encoder/nli-MiniLM2-L6-H768"
-)
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+
+MIN_RELEVANCE = 10.0
+MIN_EVIDENCE_QUALITY = 45.0
+MIN_NLI_CONFIDENCE = 65.0
 
 HEADERS = {
     "User-Agent": (
-        "TruthLensAI/7.3 "
-        "(educational misinformation analysis project)"
+        "TruthLensAI/8.0 "
+        "(evidence-based misinformation analysis project)"
     ),
     "Accept": "application/json",
 }
 
-REQUEST_DELAY = 0.25
-
-MIN_NLI_CONFIDENCE = 65.0
-
-MIN_EVIDENCE_QUALITY = 45.0
-
-
-# ============================================================
-# SOURCE RELIABILITY
-# ============================================================
-
 SOURCE_RELIABILITY_SCORES = {
-
-    "WIKIPEDIA": 85.0,
-
     "GOVERNMENT": 98.0,
-
     "ACADEMIC": 97.0,
-
     "PEER_REVIEWED": 98.0,
-
+    "WIKIDATA": 92.0,
     "REPUTABLE_NEWS": 90.0,
-
     "ORGANIZATION": 88.0,
-
+    "WIKIPEDIA": 85.0,
+    "SEARCH_ENGINE": 65.0,
     "UNKNOWN": 50.0,
 }
 
-
-# ============================================================
-# IN-MEMORY CACHES
-# ============================================================
-
-PAGE_CACHE = {}
-
-SEARCH_CACHE = {}
+PAGE_CACHE: Dict[str, Dict[str, Any]] = {}
+SEARCH_CACHE: Dict[str, Any] = {}
+WIKIDATA_CACHE: Dict[str, Any] = {}
 
 
 # ============================================================
@@ -158,113 +133,33 @@ SEARCH_CACHE = {}
 # ============================================================
 
 print("=" * 70)
-print("TruthLens AI Backend v7.3.2")
+print(f"TruthLens AI Backend v{APP_VERSION}")
+print("=" * 70)
+print("Device:", DEVICE)
+print("ONNX model:", ONNX_MODEL_FILE)
+print("Dynamic Wikipedia:", True)
+print("Dynamic Wikidata:", True)
+print("Optional Serper search:", bool(SERPER_API_KEY))
+print("Optional Tavily search:", bool(TAVILY_API_KEY))
+print("NLI disabled:", DISABLE_NLI)
 print("=" * 70)
 
-print("Device:", DEVICE)
-
-print("Model path:", MODEL_PATH)
-
-print("Hugging Face repository:", HF_MODEL_REPO)
-
-print("Hugging Face subfolder:", HF_MODEL_SUBFOLDER)
-
-print("=" * 70)
-
 
 # ============================================================
-# DISTILBERT MODEL LOADING - INT8 ONNX
+# DISTILBERT INT8 ONNX
 # ============================================================
-#
-# The deployment model is the tested 64 MB INT8 ONNX model:
-#
-#   models/distilbert_truthlens_onnx/model.int8.onnx
-#
-# ONNX Runtime is used instead of PyTorch for the main model so
-# the backend remains suitable for a small CPU-only deployment.
-#
-# NLI remains optional and disabled by default.
-# ============================================================
-
-MODEL_PATH = (
-    BASE_DIR
-    / "models"
-    / "distilbert_truthlens"
-)
-
-ONNX_MODEL_PATH = (
-    BASE_DIR
-    / "models"
-    / "distilbert_truthlens_onnx"
-)
-
-ONNX_MODEL_FILE = (
-    ONNX_MODEL_PATH
-    / "model.int8.onnx"
-)
-
-ONNX_TOKENIZER_FILE = (
-    ONNX_MODEL_PATH
-    / "tokenizer.json"
-)
-
-ONNX_TOKENIZER_CONFIG = (
-    ONNX_MODEL_PATH
-    / "tokenizer_config.json"
-)
-
-DEVICE = "cpu"
-
-# Keep the process conservative for free/small CPU instances.
-os.environ.setdefault(
-    "OMP_NUM_THREADS",
-    "1",
-)
-
-os.environ.setdefault(
-    "MKL_NUM_THREADS",
-    "1",
-)
-
-print("-" * 70)
-print("Loading TruthLens AI INT8 ONNX model...")
-print("ONNX model path:", ONNX_MODEL_FILE)
-print("Device:", DEVICE)
 
 if not ONNX_MODEL_FILE.exists():
-
     raise FileNotFoundError(
-        "INT8 ONNX model not found: "
-        f"{ONNX_MODEL_FILE}"
+        f"INT8 ONNX model not found: {ONNX_MODEL_FILE}"
     )
-
-if not ONNX_TOKENIZER_FILE.exists():
-
-    raise FileNotFoundError(
-        "ONNX tokenizer.json not found: "
-        f"{ONNX_TOKENIZER_FILE}"
-    )
-
-if not ONNX_TOKENIZER_CONFIG.exists():
-
-    raise FileNotFoundError(
-        "ONNX tokenizer_config.json not found: "
-        f"{ONNX_TOKENIZER_CONFIG}"
-    )
-
-print("Loading ONNX tokenizer...")
 
 tokenizer = AutoTokenizer.from_pretrained(
     str(ONNX_MODEL_PATH),
     local_files_only=True,
 )
 
-print("ONNX tokenizer loaded successfully.")
-
-print("Loading INT8 ONNX Runtime session...")
-
 session_options = ort.SessionOptions()
-
 session_options.intra_op_num_threads = 1
 session_options.inter_op_num_threads = 1
 session_options.graph_optimization_level = (
@@ -274,235 +169,88 @@ session_options.graph_optimization_level = (
 onnx_session = ort.InferenceSession(
     str(ONNX_MODEL_FILE),
     sess_options=session_options,
-    providers=[
-        "CPUExecutionProvider",
-    ],
+    providers=["CPUExecutionProvider"],
 )
 
 ONNX_INPUT_NAMES = {
-    item.name
-    for item in onnx_session.get_inputs()
+    item.name for item in onnx_session.get_inputs()
 }
 
 ONNX_OUTPUT_NAMES = [
-    item.name
-    for item in onnx_session.get_outputs()
+    item.name for item in onnx_session.get_outputs()
 ]
 
+print("ONNX inputs:", sorted(ONNX_INPUT_NAMES))
+print("ONNX outputs:", ONNX_OUTPUT_NAMES)
 print(
-    "ONNX inputs:",
-    sorted(ONNX_INPUT_NAMES),
-)
-
-print(
-    "ONNX outputs:",
-    ONNX_OUTPUT_NAMES,
-)
-
-print(
-    "INT8 ONNX model loaded successfully."
-)
-
-print(
-    "INT8 ONNX model size:",
-    round(
-        ONNX_MODEL_FILE.stat().st_size
-        / (1024 * 1024),
-        2,
-    ),
+    "ONNX model size:",
+    round(ONNX_MODEL_FILE.stat().st_size / (1024 * 1024), 2),
     "MB",
 )
 
+
 # ============================================================
-# OPTIONAL NLI MODEL
+# OPTIONAL NLI
 # ============================================================
 
-# Disable NLI by default for low-memory deployments (for example,
-# Render free-tier instances). Set DISABLE_NLI=false only when
-# sufficient memory is available.
-DISABLE_NLI = (
-    os.getenv(
-        "DISABLE_NLI",
-        "true",
-    ).lower()
-    == "true"
-)
-
+NLI_MODEL_NAME = "cross-encoder/nli-MiniLM2-L6-H768"
 nli_tokenizer = None
-
 nli_model = None
-
 NLI_AVAILABLE = False
-
-NLI_LABEL_IDS = {}
-
+NLI_LABEL_IDS: Dict[str, int] = {}
 NLI_ENTAILMENT_ID = None
-
 NLI_CONTRADICTION_ID = None
-
 NLI_NEUTRAL_ID = None
 
-
-if DISABLE_NLI:
-
-    print("-" * 70)
-
-    print(
-        "NLI Verification: DISABLED"
-    )
-
-    print(
-        "Reason: DISABLE_NLI=true"
-    )
-
-else:
-
-    print("-" * 70)
-
-    print(
-        "Loading semantic verification model..."
-    )
-
-    print(
-        "NLI model:",
-        NLI_MODEL_NAME,
-    )
-
+if not DISABLE_NLI:
     try:
-
-        # Import PyTorch/AutoModel only when NLI is explicitly
-        # enabled. This keeps the default deployment lightweight.
         import torch
-        from transformers import (
-            AutoModelForSequenceClassification,
-        )
+        from transformers import AutoModelForSequenceClassification
 
-        nli_tokenizer = (
-            AutoTokenizer.from_pretrained(
-                NLI_MODEL_NAME
-            )
-        )
+        print("Loading NLI model:", NLI_MODEL_NAME)
 
-        nli_model = (
-            AutoModelForSequenceClassification
-            .from_pretrained(
-                NLI_MODEL_NAME
-            )
+        nli_tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL_NAME)
+        nli_model = AutoModelForSequenceClassification.from_pretrained(
+            NLI_MODEL_NAME
         )
-
         nli_model.to(DEVICE)
-
         nli_model.eval()
-
         NLI_AVAILABLE = True
 
-        print(
-            "NLI model loaded successfully."
-        )
-
-        print(
-            "NLI labels:",
-            nli_model.config.id2label,
-        )
-
-    except Exception as error:
-
-        print(
-            "NLI model could not be loaded."
-        )
-
-        print(
-            "NLI error:",
-            repr(error),
-        )
-
-        print(
-            "Continuing without NLI verification."
-        )
-
+    except Exception as exc:
+        print("NLI load failed:", repr(exc))
         nli_tokenizer = None
-
         nli_model = None
-
         NLI_AVAILABLE = False
 
 
-# ============================================================
-# NLI LABEL MAPPING
-# ============================================================
-
 def build_nli_label_ids():
+    if not NLI_AVAILABLE or nli_model is None:
+        return {}, None, None, None
 
-    if (
-        not NLI_AVAILABLE
-        or nli_model is None
-    ):
+    labels = {
+        str(index): str(label).lower().strip()
+        for index, label in nli_model.config.id2label.items()
+    }
 
-        return (
-            {},
-            None,
-            None,
-            None,
-        )
+    entailment = None
+    contradiction = None
+    neutral = None
 
-    labels = {}
+    for index, label in labels.items():
+        if "entail" in label:
+            entailment = int(index)
+        elif "contrad" in label:
+            contradiction = int(index)
+        elif "neutral" in label:
+            neutral = int(index)
 
-    for index, label in (
-        nli_model.config.id2label.items()
-    ):
+    if None in (entailment, contradiction, neutral):
+        # Common MNLI label order.
+        if len(labels) == 3:
+            contradiction, neutral, entailment = 0, 1, 2
 
-        labels[
-            str(label)
-            .lower()
-            .strip()
-        ] = int(index)
-
-    def find_label(keyword):
-
-        for label, index in labels.items():
-
-            if keyword in label:
-
-                return index
-
-        return None
-
-    entailment_id = find_label(
-        "entail"
-    )
-
-    contradiction_id = find_label(
-        "contrad"
-    )
-
-    neutral_id = find_label(
-        "neutral"
-    )
-
-    # Some models expose LABEL_0,
-    # LABEL_1 and LABEL_2.
-    if (
-        entailment_id is None
-        or contradiction_id is None
-        or neutral_id is None
-    ):
-
-        if len(
-            nli_model.config.id2label
-        ) == 3:
-
-            contradiction_id = 0
-
-            neutral_id = 1
-
-            entailment_id = 2
-
-    return (
-        labels,
-        entailment_id,
-        contradiction_id,
-        neutral_id,
-    )
+    return labels, entailment, contradiction, neutral
 
 
 (
@@ -512,1577 +260,972 @@ def build_nli_label_ids():
     NLI_NEUTRAL_ID,
 ) = build_nli_label_ids()
 
-
-if NLI_AVAILABLE:
-
-    print(
-        "NLI labels:",
-        NLI_LABEL_IDS,
-    )
-
-    print(
-        "NLI IDs:",
-        {
-            "entailment":
-                NLI_ENTAILMENT_ID,
-
-            "contradiction":
-                NLI_CONTRADICTION_ID,
-
-            "neutral":
-                NLI_NEUTRAL_ID,
-        },
-    )
-
-
-# ============================================================
-# CANONICAL EVIDENCE
-# ============================================================
-
-CANONICAL_EVIDENCE = {
-
-    "earth_flat": {
-
-        "title": "Flat Earth",
-
-        "text": (
-            "Flat Earth is an archaic and "
-            "scientifically disproven conception "
-            "of the Earth's shape as a plane or disk. "
-            "Scientific evidence shows that Earth "
-            "is approximately spherical."
-        ),
-
-        "source":
-            "https://en.wikipedia.org/wiki/Flat_Earth",
-    },
-
-
-    "sun_star": {
-
-        "title": "Sun",
-
-        "text": (
-            "The Sun is the star located at the "
-            "centre of the Solar System. It is a "
-            "massive sphere of hot plasma and is "
-            "classified as a G-type main-sequence star."
-        ),
-
-        "source":
-            "https://en.wikipedia.org/wiki/Sun",
-    },
-
-
-    "india_country": {
-
-        "title": "India",
-
-        "text": (
-            "India is a country in South Asia. "
-            "It is a federal republic and one of "
-            "the world's most populous countries."
-        ),
-
-        "source":
-            "https://en.wikipedia.org/wiki/India",
-    },
-
-
-    "india_developed": {
-
-        "title":
-            "India — World Bank / IMF classification",
-
-        "text": (
-            "India is classified by the World Bank "
-            "as a lower-middle-income economy. "
-            "The IMF classifies India within emerging "
-            "market and developing economies. Therefore, "
-            "the claim that India is a developed country "
-            "is not supported by these classifications."
-        ),
-
-        "source":
-            "https://www.worldbank.org/en/country/india",
-    },
-
-
-    "earth_sun_orbit": {
-
-        "title": "Earth",
-
-        "text": (
-            "Earth orbits the Sun. Earth completes "
-            "one revolution around the Sun in "
-            "approximately 365.25 days."
-        ),
-
-        "source":
-            "https://en.wikipedia.org/wiki/Earth",
-    },
-
-
-    "sun_earth_orbit": {
-
-        "title": "Solar System",
-
-        "text": (
-            "Earth orbits the Sun, which is the "
-            "central star of the Solar System."
-        ),
-
-        "source":
-            "https://en.wikipedia.org/wiki/Solar_System",
-    },
-
-
-    "water_freezing": {
-
-        "title": "Water",
-
-        "text": (
-            "The freezing point of pure water is "
-            "0 degrees Celsius at standard "
-            "atmospheric pressure."
-        ),
-
-        "source":
-            "https://en.wikipedia.org/wiki/Freezing_point",
-    },
-
-
-    "water_boiling": {
-
-        "title": "Water boiling point",
-
-        "text": (
-            "The normal boiling point of water is "
-            "100 degrees Celsius at one standard "
-            "atmosphere."
-        ),
-
-        "source":
-            "https://en.wikipedia.org/wiki/Boiling_point",
-    },
-
-
-    "water_survival": {
-
-        "title": "Water and human body",
-
-        "text": (
-            "Water is essential for life. Humans "
-            "need water for essential functions "
-            "and must consume water to survive."
-        ),
-
-        "source": (
-            "https://www.usgs.gov/"
-            "water-science-school/"
-            "science/water-you-water-and-human-body"
-        ),
-    },
-
-
-    "vaccine_microchips": {
-
-        "title":
-            "COVID-19 vaccine ingredients",
-
-        "text": (
-            "COVID-19 vaccines do not contain "
-            "microchips and are not designed to "
-            "track people's movement."
-        ),
-
-        "source":
-            "https://stacks.cdc.gov/view/cdc/109015",
-    },
-
-
-    "moon_cheese": {
-
-        "title": "Moon",
-
-        "text": (
-            "The Moon is a rocky world with a crust, "
-            "mantle, and core. Lunar rocks and minerals "
-            "make up the Moon; it is not made entirely "
-            "of cheese."
-        ),
-
-        "source":
-            "https://science.nasa.gov/solar-system/moon/",
-    },
-
-
-    "oxygen_survival": {
-
-        "title": "Oxygen",
-
-        "text": (
-            "Humans need oxygen for cellular respiration "
-            "and normal survival. Oxygen is used by cells "
-            "to release energy from nutrients during "
-            "aerobic respiration."
-        ),
-
-        "source":
-            "https://en.wikipedia.org/wiki/Oxygen",
-    },
-
-
-    "pacific_larger_atlantic": {
-
-        "title": "Pacific Ocean",
-
-        "text": (
-            "The Pacific Ocean is the largest and "
-            "deepest of Earth's oceanic divisions. "
-            "It is larger in area than the Atlantic Ocean."
-        ),
-
-        "source":
-            "https://en.wikipedia.org/wiki/Pacific_Ocean",
-    },
-
-
-    "exercise_cardiovascular": {
-
-        "title": "Exercise",
-
-        "text": (
-            "Regular physical activity and exercise "
-            "can improve cardiovascular health and "
-            "reduce the risk of several chronic diseases."
-        ),
-
-        "source":
-            "https://en.wikipedia.org/wiki/Exercise",
-    },
-}
-
-
-# ============================================================
-# STOPWORDS
-# ============================================================
-
-STOPWORDS = {
-
-    "the",
-    "a",
-    "an",
-    "is",
-    "are",
-    "was",
-    "were",
-    "be",
-    "been",
-    "being",
-    "has",
-    "have",
-    "had",
-    "do",
-    "does",
-    "did",
-    "of",
-    "to",
-    "in",
-    "on",
-    "at",
-    "for",
-    "from",
-    "with",
-    "and",
-    "or",
-    "but",
-    "by",
-    "as",
-    "into",
-    "about",
-    "than",
-    "this",
-    "that",
-    "these",
-    "those",
-    "it",
-    "its",
-    "their",
-    "there",
-    "here",
-    "they",
-    "them",
-    "then",
-    "also",
-    "very",
-    "can",
-    "completely",
-}
+print(
+    "NLI:",
+    "ACTIVE" if NLI_AVAILABLE else "DISABLED",
+)
 
 
 # ============================================================
 # TEXT HELPERS
 # ============================================================
 
-def normalize_text(text):
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been",
+    "being", "has", "have", "had", "do", "does", "did", "of",
+    "to", "in", "on", "at", "for", "from", "with", "and", "or",
+    "but", "by", "as", "into", "about", "than", "this", "that",
+    "these", "those", "it", "its", "their", "there", "here",
+    "they", "them", "then", "also", "very", "can", "could",
+    "would", "should", "completely", "currently", "current",
+}
 
-    text = str(text).lower()
 
-    text = text.replace(
-        "’",
-        "'",
-    )
-
-    text = re.sub(
-        r"[^a-z0-9\s]",
-        " ",
-        text,
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    )
-
+def normalize_text(text: Any) -> str:
+    text = str(text or "").lower()
+    text = text.replace("’", "'")
+    text = re.sub(r"[^a-z0-9\s.%/-]", " ", text)
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
-def canonical_claim(claim):
-
-    return (
-        normalize_text(claim)
-        .rstrip(".!?")
-        .strip()
-    )
+def clean_display_text(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def extract_terms(text):
+def canonical_claim(claim: str) -> str:
+    return normalize_text(claim).rstrip(".!?").strip()
 
+
+def extract_terms(text: str) -> List[str]:
     return [
-        word
-        for word in normalize_text(text).split()
-        if (
-            len(word) > 2
-            and word not in STOPWORDS
-        )
+        w
+        for w in normalize_text(text).split()
+        if len(w) > 2 and w not in STOPWORDS
     ]
 
 
+def sentence_split(text: str) -> List[str]:
+    text = clean_display_text(text)
+    if not text:
+        return []
+    return [
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+", text)
+        if s.strip()
+    ]
+
+
+def unique_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for item in items:
+        key = normalize_text(item)
+        if key and key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
 # ============================================================
-# CANONICAL CLAIM TYPE
+# CLAIM STRUCTURE
 # ============================================================
 
-def canonical_type(claim):
+def extract_claim_entities(claim: str) -> List[str]:
+    """
+    Lightweight entity extraction. It intentionally does not
+    pretend to be a full NER system. It extracts useful proper
+    noun phrases for retrieval.
+    """
+    original = clean_display_text(claim)
 
-    c = canonical_claim(
-        claim
+    phrases = []
+
+    # Capitalized multi-word names.
+    for match in re.finditer(
+        r"\b(?:[A-Z][A-Za-z.'-]*\s+){1,4}[A-Z][A-Za-z.'-]*\b",
+        original,
+    ):
+        phrases.append(match.group(0).strip(" .,!?"))
+
+    # Text after 'of' is often a location/entity.
+    match = re.search(
+        r"\b(?:of|in|from)\s+([A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*){0,5})",
+        original,
+    )
+    if match:
+        phrases.append(match.group(1).strip(" .,!?"))
+
+    return unique_keep_order(phrases)[:8]
+
+
+def detect_claim_type(claim: str) -> str:
+    c = canonical_claim(claim)
+
+    if re.search(r"\bcurrent\b.*\b(?:is|was)\b", c):
+        return "CURRENT_FACT"
+
+    if re.search(
+        r"\b(?:who|which)\b.*\b(?:is|was)\b", c
+    ):
+        return "IDENTITY"
+
+    if any(x in c for x in ["won", "winner", "champion"]):
+        return "HISTORICAL_RESULT"
+
+    if any(x in c for x in ["founded", "established", "created"]):
+        return "DATE_OR_FOUNDING"
+
+    if any(x in c for x in ["born", "birth"]):
+        return "BIOGRAPHICAL"
+
+    if any(x in c for x in ["died", "death"]):
+        return "BIOGRAPHICAL"
+
+    if any(x in c for x in ["is a", "is an", "was a", "was an"]):
+        return "DEFINITION_OR_IDENTITY"
+
+    if any(x in c for x in ["%", "percent", "million", "billion"]):
+        return "NUMERIC"
+
+    if any(x in c for x in ["causes", "prevents", "cures", "increases", "reduces"]):
+        return "CAUSAL_OR_MEDICAL"
+
+    return "GENERAL"
+
+
+def parse_relation_claim(claim: str) -> Optional[Dict[str, str]]:
+    """
+    Extract generic subject/verb/object claims.
+
+    Supports common factual relations such as:
+      - "India is a country."
+      - "Kurnool was the capital of Andhra State from 1953 to 1956."
+      - "India won the 1983 Cricket World Cup."
+      - "The company founded the project in 2020."
+
+    This is intentionally generic and does not contain hard-coded facts.
+    """
+    original = clean_display_text(claim)
+
+    # Remove discourse/filler words that should not become part of the
+    # factual object, e.g. "was indeed the capital" -> "was the capital".
+    filler_pattern = (
+        r"\b(?:indeed|actually|reportedly|apparently|certainly|"
+        r"clearly|obviously|supposedly|allegedly|truly)\b"
+    )
+    normalized_claim = re.sub(
+        filler_pattern,
+        " ",
+        original,
+        flags=re.I,
+    )
+    normalized_claim = re.sub(r"\s+", " ", normalized_claim).strip()
+
+    # Ordered from more specific/multi-word verbs to simpler copulas.
+    relation_verbs = [
+        "was founded by",
+        "were founded by",
+        "was established by",
+        "were established by",
+        "was created by",
+        "were created by",
+        "was invented by",
+        "were invented by",
+        "was discovered by",
+        "were discovered by",
+        "was launched by",
+        "were launched by",
+        "is located in",
+        "are located in",
+        "was located in",
+        "were located in",
+        "is known as",
+        "was known as",
+        "are known as",
+        "were known as",
+        "is",
+        "are",
+        "was",
+        "were",
+        "has",
+        "have",
+        "had",
+        "won",
+        "wins",
+        "defeated",
+        "defeats",
+        "hosted",
+        "hosts",
+        "founded",
+        "invented",
+        "discovered",
+        "launched",
+        "served",
+        "became",
+        "held",
+        "ruled",
+        "led",
+        "created",
+        "built",
+        "established",
+        "introduced",
+        "declared",
+        "appointed",
+    ]
+
+    # Longest phrases first prevents "was" from matching inside
+    # "was founded by", etc.
+    relation_verbs = sorted(
+        relation_verbs,
+        key=len,
+        reverse=True,
+    )
+    verb_pattern = "|".join(
+        re.escape(v) for v in relation_verbs
     )
 
-    if c in {
-        "the earth is flat",
-        "earth is flat",
-    }:
-        return "earth_flat"
-
-    if c in {
-        "the sun is a star",
-        "sun is a star",
-    }:
-        return "sun_star"
-
-    if c in {
-        "india is a country",
-        "india is a country in south asia",
-    }:
-        return "india_country"
-
-    if (
-        "india is a developed country"
-        in c
-    ):
-
-        return "india_developed"
-
-    if (
-        "india is developed"
-        in c
-    ):
-
-        return "india_developed"
-
-    if c in {
-        "the earth orbits the sun",
-        "earth orbits the sun",
-        "the earth revolves around the sun",
-        "earth revolves around the sun",
-    }:
-        return "earth_sun_orbit"
-
-    if c in {
-        "the sun is orbited by the earth",
-        "sun is orbited by earth",
-    }:
-        return "sun_earth_orbit"
-
-    if (
-        "water freezes at 0"
-        in c
-        or
-        "water freezing point is 0"
-        in c
-        or
-        "water freezes at zero"
-        in c
-    ):
-        return "water_freezing"
-
-    if (
-        "water boils at 100"
-        in c
-        or
-        "water boiling point is 100"
-        in c
-        or
-        "water boils at one hundred"
-        in c
-    ):
-        return "water_boiling"
-
-    if (
-        "water is essential for life"
-        in c
-        or
-        "humans need water to survive"
-        in c
-    ):
-        return "water_survival"
-
-    if (
-        "vaccine"
-        in c
-        and
-        "microchip"
-        in c
-    ):
-        return "vaccine_microchips"
-
-    if (
-        "moon"
-        in c
-        and
-        "cheese"
-        in c
-    ):
-        return "moon_cheese"
-
-    if (
-        "oxygen"
-        in c
-        and
-        (
-            "survive"
-            in c
-            or
-            "human"
-            in c
-        )
-    ):
-        return "oxygen_survival"
-
-    if (
-        "pacific"
-        in c
-        and
-        "atlantic"
-        in c
-    ):
-        return "pacific_larger_atlantic"
-
-    if (
-        "exercise"
-        in c
-        and
-        (
-            "cardiovascular"
-            in c
-            or
-            "heart"
-            in c
-        )
-    ):
-        return "exercise_cardiovascular"
-
-    return "generic"
-
-
-# ============================================================
-# PRIORITY WIKIPEDIA TITLES
-# ============================================================
-
-def priority_titles(claim):
-
-    kind = canonical_type(
-        claim
+    pattern = (
+        rf"^(?:the\s+)?(.+?)\s+({verb_pattern})\s+"
+        rf"(.+?)[.!?]?$"
+    )
+    match = re.match(
+        pattern,
+        normalized_claim,
+        re.I,
     )
 
-    mapping = {
+    if not match:
+        return None
 
-        "earth_flat": [
-            "Flat Earth",
-            "Earth",
-        ],
+    subject = clean_display_text(match.group(1))
+    verb = clean_display_text(match.group(2)).lower()
+    obj = clean_display_text(match.group(3))
 
-        "sun_star": [
-            "Sun",
-        ],
+    if len(subject) < 2 or len(obj) < 2:
+        return None
 
-        "india_country": [
-            "India",
-        ],
-
-        "india_developed": [
-            "India",
-        ],
-
-        "earth_sun_orbit": [
-            "Earth",
-            "Solar System",
-            "Sun",
-        ],
-
-        "sun_earth_orbit": [
-            "Earth",
-            "Solar System",
-            "Sun",
-        ],
-
-        "water_freezing": [
-            "Water",
-        ],
-
-        "water_boiling": [
-            "Water",
-        ],
-
-        "water_survival": [
-            "Water",
-        ],
-
-        "vaccine_microchips": [
-            "COVID-19 vaccine",
-            "Vaccine",
-        ],
-
-        "moon_cheese": [
-            "Moon",
-        ],
-
-        "oxygen_survival": [
-            "Oxygen",
-        ],
-
-        "pacific_larger_atlantic": [
-            "Pacific Ocean",
-            "Atlantic Ocean",
-        ],
-
-        "exercise_cardiovascular": [
-            "Exercise",
-        ],
+    return {
+        "subject": subject,
+        "verb": verb,
+        "object": obj,
+        "claim_type": detect_claim_type(claim),
     }
 
-    return mapping.get(
-        kind,
-        [],
-    )
-
 
 # ============================================================
-# SEARCH QUERY GENERATION
+# GENERIC SEARCH QUERY GENERATION
 # ============================================================
 
-def generate_search_queries(
-    claim
-):
+def generate_search_queries(claim: str) -> List[str]:
+    original = clean_display_text(claim)
+    normalized = canonical_claim(claim)
+    terms = extract_terms(claim)
+    entities = extract_claim_entities(claim)
+    relation = parse_relation_claim(claim)
 
-    kind = canonical_type(
-        claim
-    )
+    queries = [original]
 
-    queries = [
-        claim
-    ]
+    if relation:
+        queries.extend(
+            [
+                f"{relation['subject']} {relation['object']}",
+                f"{relation['subject']} {relation['object']} fact",
+            ]
+        )
 
-    terms = extract_terms(
-        claim
-    )
+    if entities:
+        queries.extend(entities)
 
     if len(terms) >= 2:
+        queries.append(" ".join(terms))
 
-        queries.append(
-            " ".join(terms)
+    if "current" in normalized:
+        queries.extend(
+            [
+                f"{original} current",
+                f"{' '.join(terms)} latest",
+                f"{' '.join(terms)} official",
+            ]
         )
 
-    extra = {
+    if "who" in normalized:
+        queries.append(f"{' '.join(terms)} official")
 
-        "earth_flat": [
-            "Flat Earth",
-            "Earth shape",
-            "Earth spherical",
-        ],
+    if any(
+        word in normalized
+        for word in ["health", "disease", "medicine", "vaccine", "drug"]
+    ):
+        queries.extend(
+            [
+                f"{original} scientific evidence",
+                f"{original} study",
+            ]
+        )
 
-        "sun_star": [
-            "Sun star",
-            "Sun astronomy",
-        ],
-
-        "india_country": [
-            "India country",
-            "India South Asia",
-        ],
-
-        "india_developed": [
-            "India developed country",
-            "India World Bank classification",
-            "India IMF developing economy",
-        ],
-
-        "earth_sun_orbit": [
-            "Earth orbit Sun",
-            "Earth revolves around Sun",
-            "Earth Solar System",
-        ],
-
-        "sun_earth_orbit": [
-            "Earth orbits Sun",
-            "Solar System",
-        ],
-
-        "water_freezing": [
-            "Water freezing point",
-            "Water freezes 0 Celsius",
-            "Freezing point water",
-        ],
-
-        "water_boiling": [
-            "Water boiling point",
-            "Water boils 100 Celsius",
-            "Normal boiling point water",
-        ],
-
-        "water_survival": [
-            "Water human survival",
-            "Water essential human life",
-            "Water human body",
-        ],
-
-        "vaccine_microchips": [
-            "COVID-19 vaccine microchips",
-            "vaccines microchips",
-            "vaccine ingredients",
-        ],
-
-        "moon_cheese": [
-            "Moon composition",
-            "Moon made of cheese",
-            "Moon rocks composition",
-        ],
-
-        "oxygen_survival": [
-            "oxygen human survival",
-            "oxygen cellular respiration",
-        ],
-
-        "pacific_larger_atlantic": [
-            "Pacific Ocean Atlantic Ocean area",
-            "largest ocean Pacific",
-        ],
-
-        "exercise_cardiovascular": [
-            "exercise cardiovascular health",
-            "physical activity heart health",
-        ],
-
-    }.get(
-        kind,
-        [],
-    )
-
-    queries.extend(
-        extra
-    )
-
-    normalized = normalize_text(
-        claim
-    )
-
-    if "herbal" in normalized:
-
-        queries.extend([
-            "herbal medicine",
-            "herbal remedies",
-        ])
-
-    if "disease" in normalized:
-
-        queries.extend([
-            "disease prevention",
-            "disease evidence",
-        ])
-
-    if "prevent" in normalized:
-
-        queries.extend([
-            "disease prevention",
-        ])
-
-    cleaned = []
-
-    for query in queries:
-
-        query = query.strip()
-
-        if (
-            query
-            and
-            query not in cleaned
-        ):
-
-            cleaned.append(
-                query
-            )
-
-    return cleaned[:10]
+    return unique_keep_order(queries)[:10]
 
 
 # ============================================================
-# RELEVANCE CALCULATION
+# HTTP HELPERS
 # ============================================================
 
-def calculate_relevance(
-    claim,
-    title,
-    evidence,
+def cached_get_json(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    cache: Optional[Dict[str, Any]] = None,
 ):
+    cache = cache if cache is not None else SEARCH_CACHE
+    key = url + "|" + json.dumps(params or {}, sort_keys=True)
 
-    kind = canonical_type(
-        claim
-    )
-
-    title_lower = (
-        title
-        .lower()
-        .strip()
-    )
-
-    normalized = normalize_text(
-        evidence
-    )
-
-    # --------------------------------------------------------
-    # Exact canonical title matches
-    # --------------------------------------------------------
-
-    if (
-        kind == "earth_flat"
-        and
-        title_lower == "flat earth"
-    ):
-
-        return 100.0
-
-    if (
-        kind == "sun_star"
-        and
-        title_lower == "sun"
-    ):
-
-        return 100.0
-
-    if (
-        kind == "india_country"
-        and
-        title_lower == "india"
-    ):
-
-        return 100.0
-
-    if (
-        kind == "india_developed"
-        and
-        title_lower == "india"
-    ):
-
-        return 100.0
-
-    if (
-        kind
-        in {
-            "earth_sun_orbit",
-            "sun_earth_orbit",
-        }
-        and
-        title_lower
-        in {
-            "earth",
-            "solar system",
-            "sun",
-        }
-    ):
-
-        return 95.0
-
-    if (
-        kind
-        in {
-            "water_freezing",
-            "water_boiling",
-            "water_survival",
-        }
-        and
-        title_lower == "water"
-    ):
-
-        return 95.0
-
-    if (
-        kind == "vaccine_microchips"
-        and
-        (
-            "vaccine"
-            in title_lower
-            or
-            "covid"
-            in title_lower
-        )
-    ):
-
-        return 95.0
-
-    if (
-        kind == "moon_cheese"
-        and
-        title_lower == "moon"
-    ):
-
-        return 95.0
-
-    if (
-        kind == "oxygen_survival"
-        and
-        title_lower == "oxygen"
-    ):
-
-        return 95.0
-
-    if (
-        kind == "pacific_larger_atlantic"
-        and
-        title_lower == "pacific ocean"
-    ):
-
-        return 95.0
-
-    if (
-        kind == "exercise_cardiovascular"
-        and
-        title_lower == "exercise"
-    ):
-
-        return 95.0
-
-    # --------------------------------------------------------
-    # Keyword overlap
-    # --------------------------------------------------------
-
-    claim_terms = set(
-        extract_terms(claim)
-    )
-
-    title_terms = set(
-        extract_terms(title)
-    )
-
-    evidence_terms = set(
-        extract_terms(evidence)
-    )
-
-    if not claim_terms:
-
-        return 0.0
-
-    title_overlap = (
-        len(
-            claim_terms
-            &
-            title_terms
-        )
-        /
-        max(
-            len(claim_terms),
-            1,
-        )
-    )
-
-    evidence_overlap = (
-        len(
-            claim_terms
-            &
-            evidence_terms
-        )
-        /
-        max(
-            len(claim_terms),
-            1,
-        )
-    )
-
-    score = (
-        title_overlap * 55.0
-        +
-        evidence_overlap * 45.0
-    )
-
-    # --------------------------------------------------------
-    # Strong semantic patterns
-    # --------------------------------------------------------
-
-    patterns = {
-
-        "earth_flat": [
-            "scientifically disproven",
-            "roughly spherical",
-            "earth sphericity",
-            "earth is spherical",
-        ],
-
-        "sun_star": [
-            "sun is the star",
-            "main sequence star",
-            "g type star",
-        ],
-
-        "india_country": [
-            "india is a country",
-            "country in south asia",
-        ],
-
-        "india_developed": [
-            "lower middle income",
-            "emerging market",
-            "developing economies",
-            "developing economy",
-        ],
-
-        "earth_sun_orbit": [
-            "earth orbits the sun",
-            "earth revolves around the sun",
-            "one revolution around the sun",
-        ],
-
-        "sun_earth_orbit": [
-            "earth orbits the sun",
-            "sun is the central star",
-        ],
-
-        "water_freezing": [
-            "freezing point",
-            "0 degrees celsius",
-        ],
-
-        "water_boiling": [
-            "boiling point",
-            "100 degrees celsius",
-        ],
-
-        "water_survival": [
-            "water is essential for life",
-            "water to survive",
-            "essential functions",
-        ],
-
-        "vaccine_microchips": [
-            "do not contain microchips",
-            "microchips",
-            "track people's movement",
-        ],
-
-        "moon_cheese": [
-            "not made of cheese",
-            "lunar rocks",
-            "rocky world",
-        ],
-
-        "oxygen_survival": [
-            "humans need oxygen",
-            "cellular respiration",
-            "normal survival",
-        ],
-
-        "pacific_larger_atlantic": [
-            "largest",
-            "larger in area",
-            "atlantic ocean",
-        ],
-
-        "exercise_cardiovascular": [
-            "cardiovascular health",
-            "physical activity",
-            "exercise",
-        ],
-    }
-
-    for pattern in patterns.get(
-        kind,
-        [],
-    ):
-
-        if pattern in normalized:
-
-            score = max(
-                score,
-                95.0,
-            )
-
-    return round(
-        min(
-            score,
-            100.0,
-        ),
-        2,
-    )
-
-
-# ============================================================
-# WIKIPEDIA REQUEST
-# ============================================================
-
-def wikipedia_get(
-    params
-):
-
-    cache_key = str(
-        sorted(
-            params.items()
-        )
-    )
-
-    if cache_key in SEARCH_CACHE:
-
-        return SEARCH_CACHE[
-            cache_key
-        ]
-
-    time.sleep(
-        REQUEST_DELAY
-    )
+    if key in cache:
+        return cache[key]
 
     try:
-
+        time.sleep(REQUEST_DELAY)
         response = requests.get(
-            WIKIPEDIA_API,
+            url,
             params=params,
-            headers=HEADERS,
-            timeout=15,
+            headers=headers or HEADERS,
+            timeout=REQUEST_TIMEOUT,
         )
-
         response.raise_for_status()
-
         data = response.json()
-
-        SEARCH_CACHE[
-            cache_key
-        ] = data
-
+        cache[key] = data
         return data
+    except Exception as exc:
+        print("HTTP GET failed:", url, repr(exc))
+        return None
 
-    except Exception as error:
 
-        print(
-            "Wikipedia request failed:",
-            repr(error),
+def cached_post_json(
+    url: str,
+    data: Dict[str, Any],
+    headers: Dict[str, str],
+    cache: Optional[Dict[str, Any]] = None,
+):
+    cache = cache if cache is not None else SEARCH_CACHE
+    key = url + "|" + json.dumps(data, sort_keys=True)
+
+    if key in cache:
+        return cache[key]
+
+    try:
+        time.sleep(REQUEST_DELAY)
+        response = requests.post(
+            url,
+            json=data,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
         )
-
+        response.raise_for_status()
+        result = response.json()
+        cache[key] = result
+        return result
+    except Exception as exc:
+        print("HTTP POST failed:", url, repr(exc))
         return None
 
 
 # ============================================================
-# WIKIPEDIA PAGE
+# WIKIPEDIA
 # ============================================================
 
-def wikipedia_page_by_title(
-    title
-):
-
-    key = (
-        title
-        .lower()
-        .strip()
+def wikipedia_search(query: str) -> List[Dict[str, Any]]:
+    data = cached_get_json(
+        WIKIPEDIA_API,
+        {
+            "action": "query",
+            "format": "json",
+            "list": "search",
+            "srsearch": query,
+            "srlimit": 8,
+            "srprop": "snippet",
+        },
     )
-
-    if key in PAGE_CACHE:
-
-        return PAGE_CACHE[
-            key
-        ]
-
-    data = wikipedia_get({
-
-        "action": "query",
-
-        "format": "json",
-
-        "prop": "extracts",
-
-        "explaintext": 1,
-
-        "exintro": 1,
-
-        "redirects": 1,
-
-        "titles": title,
-
-    })
 
     if not data:
+        return []
 
-        return None
+    return data.get("query", {}).get("search", [])
 
-    pages = (
-        data
-        .get(
-            "query",
-            {},
-        )
-        .get(
-            "pages",
-            {},
-        )
+
+def wikipedia_page_by_title(title: str) -> Optional[Dict[str, Any]]:
+    key = normalize_text(title)
+
+    if key in PAGE_CACHE:
+        return PAGE_CACHE[key]
+
+    data = cached_get_json(
+        WIKIPEDIA_API,
+        {
+            "action": "query",
+            "format": "json",
+            "prop": "extracts|info",
+            "explaintext": 1,
+            "exchars": 9000,
+            "inprop": "url",
+            "redirects": 1,
+            "titles": title,
+        },
     )
 
+    if not data:
+        return None
+
+    pages = data.get("query", {}).get("pages", {})
+
     for page in pages.values():
+        extract = clean_display_text(page.get("extract", ""))
+        pageid = page.get("pageid")
 
-        pageid = page.get(
-            "pageid"
-        )
+        if not pageid or not extract:
+            continue
 
-        extract = (
-            page.get(
-                "extract",
-                "",
-            )
-            or ""
-        )
-
-        if (
-            pageid
-            and
-            extract.strip()
-        ):
-
-            result = {
-
-                "pageid":
-                    pageid,
-
-                "title":
-                    page.get(
-                        "title",
-                        title,
-                    ),
-
-                "extract":
-                    extract,
-
-                "cached":
-                    False,
-            }
-
-            PAGE_CACHE[
-                key
-            ] = result
-
-            return result
+        result = {
+            "title": page.get("title", title),
+            "extract": extract,
+            "pageid": pageid,
+            "url": (
+                page.get("fullurl")
+                or f"https://en.wikipedia.org/?curid={pageid}"
+            ),
+        }
+        PAGE_CACHE[key] = result
+        return result
 
     return None
 
 
-# ============================================================
-# WIKIPEDIA SEARCH
-# ============================================================
-
-def wikipedia_search(
-    query
-):
-
-    data = wikipedia_get({
-
-        "action": "query",
-
-        "format": "json",
-
-        "list": "search",
-
-        "srsearch": query,
-
-        "srlimit": 8,
-
-        "srprop": "snippet",
-
-    })
-
-    if not data:
-
-        return []
-
-    return (
-        data
-        .get(
-            "query",
-            {},
-        )
-        .get(
-            "search",
-            [],
-        )
-    )
-
-
-# ============================================================
-# RETRIEVE EVIDENCE
-# ============================================================
-
-def retrieve_evidence(
-    claim
-):
-
-    print("-" * 70)
-
-    print(
-        "Retrieving evidence for:",
-        claim,
-    )
-
+def wikipedia_candidates(claim: str) -> List[Dict[str, Any]]:
     candidates = []
+    seen = set()
 
-    seen_titles = set()
-
-    kind = canonical_type(
-        claim
-    )
-
-    # --------------------------------------------------------
-    # 1. CANONICAL EVIDENCE
-    # --------------------------------------------------------
-
-    local = CANONICAL_EVIDENCE.get(
-        kind
-    )
-
-    if local:
-
-        candidates.append({
-
-            "title":
-                local["title"],
-
-            "text":
-                local["text"],
-
-            "source":
-                local["source"],
-
-            "relevance":
-                100.0,
-
-            "cached":
-                True,
-        })
-
-        seen_titles.add(
-            local["title"]
-            .lower()
-        )
-
-        print(
-            "Canonical evidence:",
-            local["title"],
-        )
-
-    # --------------------------------------------------------
-    # 2. PRIORITY WIKIPEDIA PAGES
-    # --------------------------------------------------------
-
-    for title in priority_titles(
-        claim
-    ):
-
-        if len(candidates) >= 8:
-
-            break
-
-        if (
-            title.lower()
-            in seen_titles
-        ):
-
-            continue
-
-        page = (
-            wikipedia_page_by_title(
-                title
-            )
-        )
-
-        if not page:
-
-            continue
-
-        relevance = (
-            calculate_relevance(
-                claim,
-                page["title"],
-                page["extract"],
-            )
-        )
-
-        candidates.append({
-
-            "title":
-                page["title"],
-
-            "text":
-                page["extract"],
-
-            "source": (
-                "https://en.wikipedia.org/"
-                f"?curid={page['pageid']}"
-            ),
-
-            "relevance":
-                relevance,
-
-            "cached":
-                page.get(
-                    "cached",
-                    False,
-                ),
-        })
-
-        seen_titles.add(
-            page["title"]
-            .lower()
-        )
-
-    # --------------------------------------------------------
-    # 3. SEARCH
-    # --------------------------------------------------------
-
-    queries = (
-        generate_search_queries(
-            claim
-        )
-    )
-
-    print(
-        "Wikipedia queries:",
-        queries,
-    )
-
-    for query in queries:
-
-        if len(candidates) >= 10:
-
-            break
-
-        results = wikipedia_search(
-            query
-        )
-
-        print(
-            "Search:",
-            query,
-            "Results:",
-            len(results),
-        )
-
-        for result in results:
-
-            if len(candidates) >= 10:
-
-                break
-
-            title = (
-                result
-                .get(
-                    "title",
-                    "",
-                )
-                .strip()
-            )
-
+    for query in generate_search_queries(claim):
+        for result in wikipedia_search(query):
+            title = clean_display_text(result.get("title", ""))
             if not title:
-
                 continue
 
-            if (
-                title.lower()
-                in seen_titles
-            ):
-
+            key = normalize_text(title)
+            if key in seen:
                 continue
 
-            page = (
-                wikipedia_page_by_title(
-                    title
-                )
-            )
+            seen.add(key)
+            page = wikipedia_page_by_title(title)
 
             if page:
-
-                text = page[
-                    "extract"
-                ]
-
-                pageid = page[
-                    "pageid"
-                ]
-
-                final_title = page[
-                    "title"
-                ]
-
+                text = page["extract"]
+                source = page["url"]
             else:
-
-                snippet = (
-                    result
-                    .get(
-                        "snippet",
-                        "",
-                    )
-                )
-
-                snippet = re.sub(
+                text = re.sub(
                     r"<[^>]+>",
                     "",
-                    snippet,
+                    result.get("snippet", ""),
                 )
+                source = "https://en.wikipedia.org/"
 
-                snippet = snippet.strip()
-
-                if not snippet:
-
-                    continue
-
-                text = snippet
-
-                pageid = None
-
-                final_title = title
-
-            relevance = (
-                calculate_relevance(
-                    claim,
-                    final_title,
-                    text,
-                )
-            )
-
-            if relevance < 8.0:
-
+            if not text:
                 continue
 
-            if pageid:
-
-                source = (
-                    "https://en.wikipedia.org/"
-                    f"?curid={pageid}"
-                )
-
-            else:
-
-                source = (
-                    "https://en.wikipedia.org/"
-                )
-
-            candidates.append({
-
-                "title":
-                    final_title,
-
-                "text":
-                    text,
-
-                "source":
-                    source,
-
-                "relevance":
-                    relevance,
-
-                "cached":
-                    False,
-            })
-
-            seen_titles.add(
-                final_title.lower()
+            candidates.append(
+                {
+                    "title": title,
+                    "text": text[:9000],
+                    "source": source,
+                    "source_kind": "WIKIPEDIA",
+                    "retrieval": "wikipedia_search",
+                }
             )
 
-    candidates.sort(
-        key=lambda item:
-            item.get(
-                "relevance",
-                0.0,
-            ),
-        reverse=True,
-    )
+            if len(candidates) >= 12:
+                return candidates
 
-    return candidates[:10]
+    return candidates
 
 
 # ============================================================
-# SOURCE CLASSIFICATION
+# WIKIDATA
+# ============================================================
+
+def wikidata_search_entity(
+    query: str,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    data = cached_get_json(
+        WIKIDATA_API,
+        {
+            "action": "wbsearchentities",
+            "search": query,
+            "language": "en",
+            "uselang": "en",
+            "format": "json",
+            "limit": limit,
+        },
+        cache=WIKIDATA_CACHE,
+    )
+
+    if not data:
+        return []
+
+    return data.get("search", [])
+
+
+def wikidata_entity(qid: str) -> Optional[Dict[str, Any]]:
+    data = cached_get_json(
+        WIKIDATA_API,
+        {
+            "action": "wbgetentities",
+            "ids": qid,
+            "languages": "en",
+            "format": "json",
+            "props": "labels|descriptions|claims|sitelinks",
+        },
+        cache=WIKIDATA_CACHE,
+    )
+
+    if not data:
+        return None
+
+    return data.get("entities", {}).get(qid)
+
+
+def wikidata_sparql(query: str) -> List[Dict[str, str]]:
+    data = cached_get_json(
+        WIKIDATA_SPARQL,
+        {
+            "query": query,
+            "format": "json",
+        },
+        headers={
+            **HEADERS,
+            "Accept": "application/sparql-results+json",
+        },
+        cache=WIKIDATA_CACHE,
+    )
+
+    if not data:
+        return []
+
+    rows = []
+    for row in data.get("results", {}).get("bindings", []):
+        rows.append(
+            {
+                key: value.get("value", "")
+                for key, value in row.items()
+            }
+        )
+    return rows
+
+
+def build_wikidata_evidence(
+    title: str,
+    text: str,
+    url: str,
+    retrieval: str,
+) -> Dict[str, Any]:
+    return {
+        "title": title,
+        "text": clean_display_text(text)[:9000],
+        "source": url,
+        "source_kind": "WIKIDATA",
+        "retrieval": retrieval,
+    }
+
+
+def current_office_wikidata_candidates(
+    claim: str,
+) -> List[Dict[str, Any]]:
+    """
+    Handles claims such as:
+      'The current Chief Minister of Andhra Pradesh is X.'
+      'The current Prime Minister of India is X.'
+
+    It does NOT contain a hard-coded person or office. It searches
+    Wikidata for the office and then checks current P39/P1308/P6
+    relationships.
+    """
+    normalized = canonical_claim(claim)
+
+    if "current" not in normalized:
+        return []
+
+    relation = parse_relation_claim(claim)
+    if not relation:
+        return []
+
+    subject = relation["subject"]
+    obj = relation["object"]
+
+    office_match = re.search(
+        r"(?:current\s+)?(.+?)\s+of\s+(.+)$",
+        subject,
+        re.I,
+    )
+
+    if not office_match:
+        return []
+
+    office_phrase = clean_display_text(office_match.group(1))
+    jurisdiction = clean_display_text(office_match.group(2))
+
+    # "current" describes the temporal state, not the office name.
+    office_phrase = re.sub(
+        r"^current\s+",
+        "",
+        office_phrase,
+        flags=re.I,
+    ).strip()
+
+    if len(office_phrase) < 3 or len(jurisdiction) < 2:
+        return []
+
+    office_queries = [
+        f"{office_phrase} of {jurisdiction}",
+        f"{office_phrase} {jurisdiction}",
+    ]
+
+    office_entities = []
+    for q in office_queries:
+        office_entities.extend(wikidata_search_entity(q, limit=5))
+
+    office_qids = unique_keep_order(
+        [item.get("id", "") for item in office_entities]
+    )[:5]
+
+    evidence = []
+
+    # 1. Office item -> P1308 current office holder.
+    for qid in office_qids:
+        if not qid.startswith("Q"):
+            continue
+
+        sparql = f"""
+        SELECT ?person ?personLabel WHERE {{
+          wd:{qid} wdt:P1308 ?person .
+          SERVICE wikibase:label {{
+            bd:serviceParam wikibase:language "en" .
+          }}
+        }}
+        LIMIT 10
+        """
+
+        rows = wikidata_sparql(sparql)
+
+        for row in rows:
+            person = row.get("personLabel", "")
+            if not person:
+                continue
+
+            evidence.append(
+                build_wikidata_evidence(
+                    title=(
+                        f"Current holder of "
+                        f"{office_phrase} of {jurisdiction}"
+                    ),
+                    text=(
+                        f"Wikidata identifies {person} as a "
+                        f"current holder of {office_phrase} of "
+                        f"{jurisdiction}."
+                    ),
+                    url=f"https://www.wikidata.org/wiki/{qid}",
+                    retrieval="wikidata_P1308",
+                )
+            )
+
+    # 2. Jurisdiction item -> P6 head of government.
+    jurisdiction_entities = []
+    for q in [
+        jurisdiction,
+        f"{jurisdiction} government",
+    ]:
+        jurisdiction_entities.extend(
+            wikidata_search_entity(q, limit=5)
+        )
+
+    jurisdiction_qids = unique_keep_order(
+        [item.get("id", "") for item in jurisdiction_entities]
+    )[:5]
+
+    for qid in jurisdiction_qids:
+        if not qid.startswith("Q"):
+            continue
+
+        sparql = f"""
+        SELECT ?person ?personLabel WHERE {{
+          wd:{qid} wdt:P6 ?person .
+          SERVICE wikibase:label {{
+            bd:serviceParam wikibase:language "en" .
+          }}
+        }}
+        LIMIT 10
+        """
+
+        rows = wikidata_sparql(sparql)
+
+        for row in rows:
+            person = row.get("personLabel", "")
+            if not person:
+                continue
+
+            evidence.append(
+                build_wikidata_evidence(
+                    title=f"Head of government of {jurisdiction}",
+                    text=(
+                        f"Wikidata identifies {person} as the "
+                        f"head of government of {jurisdiction}."
+                    ),
+                    url=f"https://www.wikidata.org/wiki/{qid}",
+                    retrieval="wikidata_P6",
+                )
+            )
+
+    # 3. Person -> current P39. This catches office records where
+    # the office item is not linked through P1308.
+    candidate_people = wikidata_search_entity(obj, limit=5)
+
+    for person_entity in candidate_people:
+        person_qid = person_entity.get("id", "")
+        if not person_qid.startswith("Q"):
+            continue
+
+        person_data = wikidata_entity(person_qid)
+        if not person_data:
+            continue
+
+        claims = person_data.get("claims", {})
+        p39 = claims.get("P39", [])
+
+        for statement in p39:
+            mainsnak = statement.get("mainsnak", {})
+            datavalue = mainsnak.get("datavalue", {})
+            value = datavalue.get("value", {})
+
+            target_id = value.get("id")
+            if not target_id:
+                continue
+
+            qualifiers = statement.get("qualifiers", {})
+            end_values = qualifiers.get("P582", [])
+
+            # No end time is the usual Wikidata representation for
+            # a current position; also allow a future end time.
+            currently_active = not end_values
+
+            if not currently_active:
+                for end in end_values:
+                    raw = (
+                        end.get("datavalue", {})
+                        .get("value", {})
+                        .get("time", "")
+                    )
+                    if raw and raw[:5].lstrip("+").isdigit():
+                        try:
+                            year = int(raw.lstrip("+")[:4])
+                            if year >= datetime.now(timezone.utc).year:
+                                currently_active = True
+                        except ValueError:
+                            pass
+
+            if not currently_active:
+                continue
+
+            position_entity = wikidata_entity(target_id)
+            position_label = (
+                position_entity.get("labels", {})
+                .get("en", {})
+                .get("value", "")
+                if position_entity
+                else target_id
+            )
+
+            if (
+                office_phrase.lower() not in position_label.lower()
+                and jurisdiction.lower() not in position_label.lower()
+            ):
+                continue
+
+            person_label = (
+                person_data.get("labels", {})
+                .get("en", {})
+                .get("value", obj)
+            )
+
+            evidence.append(
+                build_wikidata_evidence(
+                    title=f"{person_label} — position held",
+                    text=(
+                        f"Wikidata records {person_label} as "
+                        f"currently holding the position "
+                        f"{position_label}."
+                    ),
+                    url=f"https://www.wikidata.org/wiki/{person_qid}",
+                    retrieval="wikidata_P39",
+                )
+            )
+
+    return evidence[:10]
+
+
+def wikidata_general_candidates(
+    claim: str,
+) -> List[Dict[str, Any]]:
+    """
+    Adds structured entity evidence for arbitrary claims. This is
+    deliberately conservative: it does not invent facts from a
+    Wikidata label; it only uses labels/descriptions that are
+    actually returned.
+    """
+    candidates = []
+    for query in generate_search_queries(claim)[:4]:
+        for entity in wikidata_search_entity(query, limit=3):
+            qid = entity.get("id", "")
+            if not qid.startswith("Q"):
+                continue
+
+            label = (
+                entity.get("label")
+                or entity.get("match", {}).get("text")
+                or qid
+            )
+            description = clean_display_text(
+                entity.get("description", "")
+            )
+
+            if not description:
+                continue
+
+            candidates.append(
+                build_wikidata_evidence(
+                    title=label,
+                    text=f"{label}: {description}.",
+                    url=f"https://www.wikidata.org/wiki/{qid}",
+                    retrieval="wikidata_entity_search",
+                )
+            )
+
+    return candidates[:8]
+
+
+# ============================================================
+# OPTIONAL WEB SEARCH
+# ============================================================
+
+def serper_candidates(claim: str) -> List[Dict[str, Any]]:
+    if not SERPER_API_KEY:
+        return []
+
+    data = cached_post_json(
+        "https://google.serper.dev/search",
+        {
+            "q": claim,
+            "num": 8,
+        },
+        headers={
+            "X-API-KEY": SERPER_API_KEY,
+            "Content-Type": "application/json",
+        },
+    )
+
+    if not data:
+        return []
+
+    candidates = []
+    for item in data.get("organic", []):
+        title = clean_display_text(item.get("title", ""))
+        snippet = clean_display_text(item.get("snippet", ""))
+        link = item.get("link", "")
+
+        if title and snippet and link:
+            candidates.append(
+                {
+                    "title": title,
+                    "text": snippet,
+                    "source": link,
+                    "source_kind": "SEARCH_ENGINE",
+                    "retrieval": "serper",
+                }
+            )
+
+    return candidates[:8]
+
+
+def tavily_candidates(claim: str) -> List[Dict[str, Any]]:
+    if not TAVILY_API_KEY:
+        return []
+
+    data = cached_post_json(
+        "https://api.tavily.com/search",
+        {
+            "api_key": TAVILY_API_KEY,
+            "query": claim,
+            "search_depth": "advanced",
+            "max_results": 8,
+            "include_answer": False,
+        },
+        headers={
+            "Content-Type": "application/json",
+        },
+    )
+
+    if not data:
+        return []
+
+    candidates = []
+    for item in data.get("results", []):
+        title = clean_display_text(item.get("title", ""))
+        content = clean_display_text(item.get("content", ""))
+        url = item.get("url", "")
+
+        if title and content and url:
+            candidates.append(
+                {
+                    "title": title,
+                    "text": content,
+                    "source": url,
+                    "source_kind": "SEARCH_ENGINE",
+                    "retrieval": "tavily",
+                }
+            )
+
+    return candidates[:8]
+
+
+# ============================================================
+# SOURCE RELIABILITY
 # ============================================================
 
 def classify_source(
-    source,
-    title=""
-):
-
-    source = str(
-        source
-    ).lower()
-
-    title = str(
-        title
-    ).lower()
+    source: str,
+    title: str = "",
+) -> str:
+    source_l = str(source).lower()
+    title_l = str(title).lower()
 
     if any(
-        x in source
-        for x in (
+        x in source_l
+        for x in [
             ".gov",
             ".gov.in",
             ".nic.in",
-        )
+        ]
     ):
-
         return "GOVERNMENT"
 
     if any(
-        x in source
-        for x in (
+        x in source_l
+        for x in [
             ".edu",
             ".ac.uk",
             ".ac.in",
-        )
+        ]
     ):
-
         return "ACADEMIC"
 
     if any(
-        x in source
-        for x in (
+        x in source_l
+        for x in [
             "pubmed",
             "ncbi.nlm.nih.gov",
             "nature.com",
@@ -2090,842 +1233,453 @@ def classify_source(
             "springer.com",
             "ieee.org",
             "nih.gov",
-        )
+        ]
     ):
-
         return "PEER_REVIEWED"
 
-    if (
-        "wikipedia.org"
-        in source
-        or
-        "wikipedia"
-        in title
-    ):
+    if "wikidata.org" in source_l:
+        return "WIKIDATA"
 
+    if "wikipedia.org" in source_l or "wikipedia" in title_l:
         return "WIKIPEDIA"
 
     if any(
-        x in source
-        for x in (
-            "worldbank.org",
-            "imf.org",
-        )
-    ):
-
-        return "ORGANIZATION"
-
-    if any(
-        x in source
-        for x in (
+        x in source_l
+        for x in [
             "reuters.com",
             "apnews.com",
             "bbc.com",
             "bbc.co.uk",
             "theguardian.com",
-        )
+            "nytimes.com",
+        ]
     ):
-
         return "REPUTABLE_NEWS"
+
+    if any(
+        x in source_l
+        for x in [
+            "who.int",
+            "un.org",
+            "worldbank.org",
+            "imf.org",
+            "nasa.gov",
+            "cdc.gov",
+            "fda.gov",
+            "ec.europa.eu",
+        ]
+    ):
+        return "ORGANIZATION"
+
+    if title_l:
+        return "UNKNOWN"
 
     return "UNKNOWN"
 
 
-# ============================================================
-# SOURCE RELIABILITY
-# ============================================================
-
 def calculate_source_reliability(
-    source_url,
-    title=""
-):
-
-    source_type = classify_source(
-        source_url,
-        title,
-    )
-
+    source_url: str,
+    title: str = "",
+) -> Dict[str, Any]:
+    source_type = classify_source(source_url, title)
     score = SOURCE_RELIABILITY_SCORES.get(
         source_type,
-        SOURCE_RELIABILITY_SCORES[
-            "UNKNOWN"
-        ],
+        SOURCE_RELIABILITY_SCORES["UNKNOWN"],
     )
 
-    if score >= 85:
-
+    if score >= 90:
         level = "HIGH"
-
-    elif score >= 65:
-
+    elif score >= 70:
         level = "MEDIUM"
-
     else:
-
         level = "LOW"
 
     return {
-
-        "type":
-            source_type,
-
-        "score":
-            round(
-                score,
-                2,
-            ),
-
-        "level":
-            level,
+        "type": source_type,
+        "score": round(score, 2),
+        "level": level,
     }
 
 
 # ============================================================
-# EVIDENCE QUALITY
+# RELEVANCE
 # ============================================================
 
-def calculate_evidence_quality(
-    relevance,
-    verification,
-    source_reliability,
-):
+def calculate_relevance(
+    claim: str,
+    title: str,
+    evidence: str,
+) -> float:
+    claim_terms = set(extract_terms(claim))
+    title_terms = set(extract_terms(title))
+    evidence_terms = set(extract_terms(evidence))
 
-    relevance_score = max(
-        0.0,
-        min(
-            float(relevance),
-            100.0,
+    if not claim_terms:
+        return 0.0
+
+    title_overlap = (
+        len(claim_terms & title_terms) / len(claim_terms)
+    )
+    evidence_overlap = (
+        len(claim_terms & evidence_terms) / len(claim_terms)
+    )
+
+    score = (
+        title_overlap * 60.0
+        + evidence_overlap * 40.0
+    )
+
+    relation = parse_relation_claim(claim)
+    normalized_evidence = normalize_text(evidence)
+
+    if relation:
+        subject_terms = set(extract_terms(relation["subject"]))
+        object_terms = set(extract_terms(relation["object"]))
+
+        subject_hit = bool(subject_terms & evidence_terms)
+        object_hit = bool(object_terms & evidence_terms)
+
+        if subject_hit:
+            score += 20.0
+        if object_hit:
+            score += 20.0
+
+    if canonical_claim(claim) in normalized_evidence:
+        score = max(score, 98.0)
+
+    return round(min(score, 100.0), 2)
+
+
+# ============================================================
+# DYNAMIC EVIDENCE RETRIEVAL
+# ============================================================
+
+def retrieve_evidence(claim: str) -> List[Dict[str, Any]]:
+    print("-" * 70)
+    print("DYNAMIC RETRIEVAL:", claim)
+
+    candidates = []
+
+    # Structured current-office lookup first.
+    candidates.extend(
+        current_office_wikidata_candidates(claim)
+    )
+
+    # General structured knowledge.
+    candidates.extend(
+        wikidata_general_candidates(claim)
+    )
+
+    # Reference evidence.
+    candidates.extend(
+        wikipedia_candidates(claim)
+    )
+
+    # Optional real web search if a provider key is configured.
+    if SERPER_API_KEY:
+        candidates.extend(serper_candidates(claim))
+
+    if TAVILY_API_KEY:
+        candidates.extend(tavily_candidates(claim))
+
+    # De-duplicate by URL/title/text.
+    unique = []
+    seen = set()
+
+    for candidate in candidates:
+        key = (
+            normalize_text(candidate.get("source", "")),
+            normalize_text(candidate.get("title", "")),
+            normalize_text(candidate.get("text", ""))[:300],
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(candidate)
+
+    # Score relevance now, after all sources have been collected.
+    for candidate in unique:
+        candidate["relevance"] = calculate_relevance(
+            claim,
+            candidate.get("title", ""),
+            candidate.get("text", ""),
+        )
+
+    unique = [
+        item for item in unique
+        if item["relevance"] >= MIN_RELEVANCE
+    ]
+
+    # Prefer high-reliability sources when relevance is similar.
+    for candidate in unique:
+        candidate["source_reliability"] = (
+            calculate_source_reliability(
+                candidate.get("source", ""),
+                candidate.get("title", ""),
+            )
+        )
+
+    unique.sort(
+        key=lambda item: (
+            item["relevance"],
+            item["source_reliability"]["score"],
         ),
-    )
-
-    verification_score = max(
-        0.0,
-        min(
-            float(
-                verification.get(
-                    "confidence",
-                    0.0,
-                )
-            ),
-            100.0,
-        ),
-    )
-
-    reliability_score = max(
-        0.0,
-        min(
-            float(
-                source_reliability.get(
-                    "score",
-                    50.0,
-                )
-            ),
-            100.0,
-        ),
-    )
-
-    quality = (
-        verification_score * 0.50
-        +
-        relevance_score * 0.30
-        +
-        reliability_score * 0.20
-    )
-
-    return round(
-        quality,
-        2,
-    )
-
-
-# ============================================================
-# DETERMINISTIC VERIFICATION
-# ============================================================
-
-def deterministic_verification(
-    claim,
-    evidence,
-):
-
-    c = canonical_claim(
-        claim
-    )
-
-    e = normalize_text(
-        evidence
-    )
-
-    # --------------------------------------------------------
-    # INDIA IS A COUNTRY
-    # --------------------------------------------------------
-
-    if c in {
-        "india is a country",
-        "india is a country in south asia",
-    }:
-
-        if (
-            "india is a country"
-            in e
-            or
-            "country in south asia"
-            in e
-        ):
-
-            return {
-
-                "status":
-                    "SUPPORTED",
-
-                "confidence":
-                    99.0,
-
-                "supported_score":
-                    99.0,
-
-                "contradicted_score":
-                    0.0,
-
-                "neutral_score":
-                    1.0,
-
-                "evidence_used":
-                    evidence[:3500],
-
-                "verification_method":
-                    "deterministic_evidence_match",
-            }
-
-    # --------------------------------------------------------
-    # SUN IS A STAR
-    # --------------------------------------------------------
-
-    if c in {
-        "the sun is a star",
-        "sun is a star",
-    }:
-
-        if (
-            "sun is the star"
-            in e
-            or
-            "sun is a star"
-            in e
-            or
-            "g type"
-            in e
-        ):
-
-            return {
-
-                "status":
-                    "SUPPORTED",
-
-                "confidence":
-                    99.0,
-
-                "supported_score":
-                    99.0,
-
-                "contradicted_score":
-                    0.0,
-
-                "neutral_score":
-                    1.0,
-
-                "evidence_used":
-                    evidence[:3500],
-
-                "verification_method":
-                    "deterministic_evidence_match",
-            }
-
-    # --------------------------------------------------------
-    # EARTH IS FLAT
-    # --------------------------------------------------------
-
-    if c in {
-        "the earth is flat",
-        "earth is flat",
-    }:
-
-        if (
-            "scientifically disproven"
-            in e
-            or
-            "roughly spherical"
-            in e
-            or
-            "earth sphericity"
-            in e
-            or
-            "earth is spherical"
-            in e
-        ):
-
-            return {
-
-                "status":
-                    "CONTRADICTED",
-
-                "confidence":
-                    99.0,
-
-                "supported_score":
-                    0.0,
-
-                "contradicted_score":
-                    99.0,
-
-                "neutral_score":
-                    1.0,
-
-                "evidence_used":
-                    evidence[:3500],
-
-                "verification_method":
-                    "deterministic_evidence_match",
-            }
-
-    # --------------------------------------------------------
-    # INDIA DEVELOPED
-    # --------------------------------------------------------
-
-    if (
-        "india"
-        in c
-        and
-        (
-            "developed"
-            in c
-            or
-            "developing"
-            in c
-        )
-    ):
-
-        if (
-            "lower middle income"
-            in e
-            or
-            "emerging market"
-            in e
-            or
-            "developing economies"
-            in e
-            or
-            "developing economy"
-            in e
-        ):
-
-            return {
-
-                "status":
-                    "CONTRADICTED",
-
-                "confidence":
-                    95.0,
-
-                "supported_score":
-                    0.0,
-
-                "contradicted_score":
-                    95.0,
-
-                "neutral_score":
-                    5.0,
-
-                "evidence_used":
-                    evidence[:3500],
-
-                "verification_method":
-                    "deterministic_evidence_match",
-            }
-
-    # --------------------------------------------------------
-    # EARTH ORBITS SUN
-    # --------------------------------------------------------
-
-    if (
-        c
-        in {
-            "the earth orbits the sun",
-            "earth orbits the sun",
-            "the earth revolves around the sun",
-            "earth revolves around the sun",
-        }
-    ):
-
-        if (
-            "earth orbits the sun"
-            in e
-            or
-            "earth revolves around the sun"
-            in e
-            or
-            "one revolution around the sun"
-            in e
-        ):
-
-            return {
-
-                "status":
-                    "SUPPORTED",
-
-                "confidence":
-                    99.0,
-
-                "supported_score":
-                    99.0,
-
-                "contradicted_score":
-                    0.0,
-
-                "neutral_score":
-                    1.0,
-
-                "evidence_used":
-                    evidence[:3500],
-
-                "verification_method":
-                    "deterministic_evidence_match",
-            }
-
-    # --------------------------------------------------------
-    # WATER FREEZING
-    # --------------------------------------------------------
-
-    if (
-        canonical_type(
-            claim
-        )
-        == "water_freezing"
-    ):
-
-        if (
-            "freezing point"
-            in e
-            and
-            "0 degrees celsius"
-            in e
-        ):
-
-            return {
-
-                "status":
-                    "SUPPORTED",
-
-                "confidence":
-                    99.0,
-
-                "supported_score":
-                    99.0,
-
-                "contradicted_score":
-                    0.0,
-
-                "neutral_score":
-                    1.0,
-
-                "evidence_used":
-                    evidence[:3500],
-
-                "verification_method":
-                    "deterministic_evidence_match",
-            }
-
-    # --------------------------------------------------------
-    # WATER BOILING
-    # --------------------------------------------------------
-
-    if (
-        canonical_type(
-            claim
-        )
-        == "water_boiling"
-    ):
-
-        if (
-            "boiling point"
-            in e
-            and
-            "100 degrees celsius"
-            in e
-        ):
-
-            return {
-
-                "status":
-                    "SUPPORTED",
-
-                "confidence":
-                    99.0,
-
-                "supported_score":
-                    99.0,
-
-                "contradicted_score":
-                    0.0,
-
-                "neutral_score":
-                    1.0,
-
-                "evidence_used":
-                    evidence[:3500],
-
-                "verification_method":
-                    "deterministic_evidence_match",
-            }
-
-    # --------------------------------------------------------
-    # VACCINE MICROCHIPS
-    # --------------------------------------------------------
-
-    if (
-        canonical_type(
-            claim
-        )
-        == "vaccine_microchips"
-    ):
-
-        if (
-            "do not contain microchips"
-            in e
-            or
-            "microchips"
-            in e
-            and
-            "track"
-            in e
-        ):
-
-            return {
-
-                "status":
-                    "CONTRADICTED",
-
-                "confidence":
-                    95.0,
-
-                "supported_score":
-                    0.0,
-
-                "contradicted_score":
-                    95.0,
-
-                "neutral_score":
-                    5.0,
-
-                "evidence_used":
-                    evidence[:3500],
-
-                "verification_method":
-                    "deterministic_evidence_match",
-            }
-
-    # --------------------------------------------------------
-    # MOON CHEESE
-    # --------------------------------------------------------
-
-    if (
-        canonical_type(
-            claim
-        )
-        == "moon_cheese"
-    ):
-
-        if (
-            "not made of cheese"
-            in e
-            or
-            "lunar rocks"
-            in e
-        ):
-
-            return {
-
-                "status":
-                    "CONTRADICTED",
-
-                "confidence":
-                    95.0,
-
-                "supported_score":
-                    0.0,
-
-                "contradicted_score":
-                    95.0,
-
-                "neutral_score":
-                    5.0,
-
-                "evidence_used":
-                    evidence[:3500],
-
-                "verification_method":
-                    "deterministic_evidence_match",
-            }
-
-    # --------------------------------------------------------
-    # OXYGEN
-    # --------------------------------------------------------
-
-    if (
-        canonical_type(
-            claim
-        )
-        == "oxygen_survival"
-    ):
-
-        if (
-            "humans need oxygen"
-            in e
-            or
-            "cellular respiration"
-            in e
-        ):
-
-            return {
-
-                "status":
-                    "SUPPORTED",
-
-                "confidence":
-                    95.0,
-
-                "supported_score":
-                    95.0,
-
-                "contradicted_score":
-                    0.0,
-
-                "neutral_score":
-                    5.0,
-
-                "evidence_used":
-                    evidence[:3500],
-
-                "verification_method":
-                    "deterministic_evidence_match",
-            }
-
-    return None
-
-
-# ============================================================
-# SELECT RELEVANT EVIDENCE
-# ============================================================
-
-def select_relevant_evidence(
-    claim,
-    evidence,
-):
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        str(evidence),
-    ).strip()
-
-    if not text:
-
-        return ""
-
-    sentences = re.split(
-        r"(?<=[.!?])\s+",
-        text,
-    )
-
-    claim_terms = set(
-        extract_terms(claim)
-    )
-
-    claim_norm = normalize_text(
-        claim
-    )
-
-    scored = []
-
-    for sentence in sentences:
-
-        sentence_norm = (
-            normalize_text(
-                sentence
-            )
-        )
-
-        sentence_terms = set(
-            extract_terms(
-                sentence
-            )
-        )
-
-        score = len(
-            claim_terms
-            &
-            sentence_terms
-        )
-
-        if (
-            claim_norm
-            and
-            claim_norm
-            in sentence_norm
-        ):
-
-            score += 100
-
-        if (
-            claim_norm
-            == "india is a country"
-            and
-            "india is a country"
-            in sentence_norm
-        ):
-
-            score += 100
-
-        if (
-            "sun"
-            in claim_norm
-            and
-            "star"
-            in claim_norm
-            and
-            (
-                "sun is the star"
-                in sentence_norm
-                or
-                "sun is a star"
-                in sentence_norm
-            )
-        ):
-
-            score += 100
-
-        if (
-            "earth"
-            in claim_norm
-            and
-            "flat"
-            in claim_norm
-            and
-            (
-                "scientifically disproven"
-                in sentence_norm
-                or
-                "roughly spherical"
-                in sentence_norm
-                or
-                "earth is spherical"
-                in sentence_norm
-            )
-        ):
-
-            score += 100
-
-        scored.append(
-            (
-                score,
-                sentence,
-            )
-        )
-
-    scored.sort(
-        key=lambda item:
-            item[0],
         reverse=True,
     )
 
-    selected = " ".join(
-        sentence
-        for _, sentence
-        in scored[:4]
+    print("Evidence candidates:", len(unique))
+
+    for item in unique[:10]:
+        print(
+            " -",
+            item["title"],
+            "| relevance=",
+            item["relevance"],
+            "| source=",
+            item["source_reliability"]["type"],
+        )
+
+    return unique[:12]
+
+
+# ============================================================
+# GENERIC DETERMINISTIC VERIFICATION
+# ============================================================
+
+NEGATION_WORDS = {
+    "not", "no", "never", "without", "cannot", "can't",
+    "doesn't", "doesnt", "isn't", "isnt", "wasn't", "wasnt",
+    "false", "incorrect", "disproven", "debunked",
+}
+
+
+def numbers_in(text: str) -> List[str]:
+    return re.findall(
+        r"\b\d+(?:\.\d+)?\b",
+        normalize_text(text),
     )
 
-    return selected[:3500]
+
+def name_like_tokens(text: str) -> List[str]:
+    words = re.findall(
+        r"\b[A-Z][A-Za-z.'-]{2,}\b",
+        clean_display_text(text),
+    )
+    return unique_keep_order(words)
+
+
+def sentence_contains_claim_terms(
+    claim: str,
+    sentence: str,
+    minimum_ratio: float = 0.45,
+) -> bool:
+    claim_terms = set(extract_terms(claim))
+    sent_terms = set(extract_terms(sentence))
+
+    if not claim_terms:
+        return False
+
+    ratio = len(claim_terms & sent_terms) / len(claim_terms)
+    return ratio >= minimum_ratio
+
+
+def deterministic_verification(
+    claim: str,
+    evidence: str,
+) -> Optional[Dict[str, Any]]:
+    """Use high-precision sentence-level checks; avoid word-overlap guesses.
+
+    Returns None when the evidence does not express the claimed relation
+    clearly enough. That is intentional: without NLI, uncertainty must not
+    be converted into a confident true/false label.
+    """
+    c = canonical_claim(claim)
+    if not c:
+        return None
+
+    sentences = sentence_split(evidence)
+    negative_context = re.compile(
+        r"\b(?:not true|false claim|factually incorrect|incorrect claim|"
+        r"debunked|disproven|myth|misinformation|untrue|isn't true|is not true)\b",
+        re.I,
+    )
+
+    # Exact full-claim occurrence is useful, but a debunking context must
+    # not be mistaken for support.
+    for sentence in sentences:
+        normalized_sentence = normalize_text(sentence)
+        if c in normalized_sentence:
+            if negative_context.search(sentence):
+                return {
+                    "status": "NEUTRAL", "confidence": 0.0,
+                    "supported_score": 0.0, "contradicted_score": 0.0,
+                    "neutral_score": 100.0, "evidence_used": sentence[:3500],
+                    "verification_method": "exact_match_in_qualified_context",
+                }
+            return {
+                "status": "SUPPORTED", "confidence": 90.0,
+                "supported_score": 90.0, "contradicted_score": 0.0,
+                "neutral_score": 10.0, "evidence_used": sentence[:3500],
+                "verification_method": "generic_exact_match",
+            }
+
+    relation = parse_relation_claim(claim)
+    if not relation:
+        return None
+
+    subject = normalize_text(relation["subject"])
+    obj = normalize_text(relation["object"])
+    subject_terms = set(extract_terms(subject))
+    object_terms = set(extract_terms(obj))
+    claim_nums = set(numbers_in(claim))
+    if not subject_terms or not object_terms:
+        return None
+
+    # Normalize common date-range punctuation (1953–1956, 1953-1956).
+    def norm_nums(text: str) -> set:
+        return set(numbers_in(text))
+
+    # Conservative support: the same subject must be present in the
+    # sentence, or be the clear antecedent of a following "it/the city"
+    # sentence. The predicate/object must match substantially and claim
+    # numbers must also appear in the supporting context.
+    for index, sentence in enumerate(sentences):
+        s_norm = normalize_text(sentence)
+        sent_terms = set(extract_terms(sentence))
+        subject_hit = subject in s_norm or bool(subject_terms and subject_terms.issubset(sent_terms))
+        context = sentence
+        if not subject_hit and index > 0 and re.match(r"\s*(?:it|the city|this city|the country|this country)\b", sentence, re.I):
+            previous = normalize_text(sentences[index - 1])
+            if subject in previous or (subject_terms and subject_terms.issubset(set(extract_terms(previous)))):
+                subject_hit = True
+                context = sentences[index - 1] + " " + sentence
+                s_norm = normalize_text(context)
+                sent_terms = set(extract_terms(context))
+        if not subject_hit:
+            continue
+
+        object_overlap = len(object_terms & sent_terms) / max(1, len(object_terms))
+        if object_overlap >= 0.70 and (not claim_nums or claim_nums.issubset(norm_nums(context))):
+            # Require an explicit relational cue; do not treat co-occurrence
+            # of a subject and object as a fact by itself.
+            relation_cue = re.search(
+                r"\b(?:is|are|was|were|served as|formerly served as|became|"
+                r"known as|located in|won|founded|established|created)\b",
+                context, re.I,
+            )
+            if relation_cue and not negative_context.search(context):
+                return {
+                    "status": "SUPPORTED", "confidence": 86.0,
+                    "supported_score": 86.0, "contradicted_score": 4.0,
+                    "neutral_score": 10.0, "evidence_used": context[:3500],
+                    "verification_method": "deterministic_evidence_match",
+                }
+
+    # Conservative contradiction for directly competing subjects that share
+    # an explicit superlative predicate, e.g. "Earth is the largest planet"
+    # vs "Jupiter is the largest planet". This only applies when the evidence
+    # sentence explicitly names a different subject and repeats the predicate.
+    superlative = re.search(
+        r"\b(?:is|was|are|were)\s+(?:the\s+)?(largest|smallest|oldest|youngest|"
+        r"highest|lowest|longest|shortest|fastest|slowest|biggest|tallest)\s+(.+)$",
+        relation["subject"] + " " + relation["verb"] + " " + relation["object"],
+        re.I,
+    )
+    if superlative:
+        predicate_terms = set(extract_terms(superlative.group(1) + " " + superlative.group(2)))
+        for sentence in sentences:
+            sent_terms = set(extract_terms(sentence))
+            if len(predicate_terms & sent_terms) / max(1, len(predicate_terms)) < 0.80:
+                continue
+            # Look for a distinct grammatical subject before the superlative.
+            match = re.search(
+                r"^\s*(?:the\s+)?([A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*){0,3})\s+"
+                r"(?:is|was|are|were)\s+(?:the\s+)?(?:largest|smallest|oldest|youngest|"
+                r"highest|lowest|longest|shortest|fastest|slowest|biggest|tallest)\b",
+                sentence,
+            )
+            if match and normalize_text(match.group(1)) != subject:
+                return {
+                    "status": "CONTRADICTED", "confidence": 86.0,
+                    "supported_score": 4.0, "contradicted_score": 86.0,
+                    "neutral_score": 10.0, "evidence_used": sentence[:3500],
+                    "verification_method": "deterministic_evidence_match",
+                }
+
+    return None
 
 
 # ============================================================
 # NLI VERIFICATION
 # ============================================================
 
+def select_relevant_evidence(
+    claim: str,
+    evidence: str,
+    max_sentences: int = 6,
+) -> str:
+    sentences = sentence_split(evidence)
+    claim_terms = set(extract_terms(claim))
+
+    scored = []
+
+    for sentence in sentences:
+        sentence_terms = set(extract_terms(sentence))
+        overlap = len(claim_terms & sentence_terms)
+
+        if normalize_text(claim) in normalize_text(sentence):
+            overlap += 100
+
+        scored.append((overlap, sentence))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    selected = [
+        sentence
+        for score, sentence in scored[:max_sentences]
+        if score > 0
+    ]
+
+    return " ".join(selected)[:3500]
+
+
 def nli_verify(
-    claim,
-    evidence,
-):
-
-    if (
-        not NLI_AVAILABLE
-        or
-        nli_model is None
-        or
-        nli_tokenizer is None
-    ):
-
+    claim: str,
+    evidence: str,
+) -> Dict[str, Any]:
+    if not NLI_AVAILABLE:
         return {
-
-            "status":
-                "NEUTRAL",
-
-            "confidence":
-                0.0,
-
-            "supported_score":
-                0.0,
-
-            "contradicted_score":
-                0.0,
-
-            "neutral_score":
-                100.0,
-
-            "evidence_used":
-                evidence[:3500],
-
-            "verification_method":
-                "NLI_DISABLED",
+            "status": "NEUTRAL",
+            "confidence": 0.0,
+            "supported_score": 0.0,
+            "contradicted_score": 0.0,
+            "neutral_score": 100.0,
+            "evidence_used": evidence[:3500],
+            "verification_method": "NLI_DISABLED",
         }
 
-    evidence_used = (
-        select_relevant_evidence(
-            claim,
-            evidence,
-        )
+    evidence_used = select_relevant_evidence(
+        claim,
+        evidence,
     )
 
     if not evidence_used:
-
         return {
-
-            "status":
-                "NEUTRAL",
-
-            "confidence":
-                0.0,
-
-            "supported_score":
-                0.0,
-
-            "contradicted_score":
-                0.0,
-
-            "neutral_score":
-                100.0,
-
-            "evidence_used":
-                "",
-
-            "verification_method":
-                "NLI",
+            "status": "NEUTRAL",
+            "confidence": 0.0,
+            "supported_score": 0.0,
+            "contradicted_score": 0.0,
+            "neutral_score": 100.0,
+            "evidence_used": "",
+            "verification_method": "NLI",
         }
 
     try:
-
-        # PyTorch is imported lazily because NLI is disabled by
-        # default on low-memory deployments.
         import torch
 
+        # Premise = evidence, hypothesis = user claim.
         inputs = nli_tokenizer(
             evidence_used,
             claim,
@@ -2935,193 +1689,98 @@ def nli_verify(
             max_length=512,
         )
 
-        inputs = {
-            key: value.to(
-                DEVICE
-            )
-            for key, value
-            in inputs.items()
-        }
-
         with torch.no_grad():
+            outputs = nli_model(**inputs)
+            probabilities = torch.softmax(
+                outputs.logits,
+                dim=-1,
+            )[0]
 
-            outputs = (
-                nli_model(
-                    **inputs
-                )
-            )
-
-            probabilities = (
-                torch.softmax(
-                    outputs.logits,
-                    dim=-1,
-                )[0]
-            )
-
-        if (
-            NLI_ENTAILMENT_ID
-            is None
-            or
-            NLI_CONTRADICTION_ID
-            is None
-            or
-            NLI_NEUTRAL_ID
-            is None
+        if None in (
+            NLI_ENTAILMENT_ID,
+            NLI_CONTRADICTION_ID,
+            NLI_NEUTRAL_ID,
         ):
-
             raise RuntimeError(
-                "NLI labels could not "
-                f"be resolved: {NLI_LABEL_IDS}"
+                f"NLI labels unresolved: {NLI_LABEL_IDS}"
             )
 
         entailment = (
-            float(
-                probabilities[
-                    NLI_ENTAILMENT_ID
-                ].item()
-            )
-            * 100
+            float(probabilities[NLI_ENTAILMENT_ID]) * 100
         )
-
         contradiction = (
-            float(
-                probabilities[
-                    NLI_CONTRADICTION_ID
-                ].item()
-            )
-            * 100
+            float(probabilities[NLI_CONTRADICTION_ID]) * 100
         )
-
         neutral = (
-            float(
-                probabilities[
-                    NLI_NEUTRAL_ID
-                ].item()
-            )
-            * 100
+            float(probabilities[NLI_NEUTRAL_ID]) * 100
         )
 
         scores = {
-
-            "SUPPORTED":
-                entailment,
-
-            "CONTRADICTED":
-                contradiction,
-
-            "NEUTRAL":
-                neutral,
+            "SUPPORTED": entailment,
+            "CONTRADICTED": contradiction,
+            "NEUTRAL": neutral,
         }
 
-        status = max(
-            scores,
-            key=scores.get,
-        )
+        status = max(scores, key=scores.get)
 
         return {
-
-            "status":
-                status,
-
-            "confidence":
-                round(
-                    scores[status],
-                    2,
-                ),
-
-            "supported_score":
-                round(
-                    entailment,
-                    2,
-                ),
-
-            "contradicted_score":
-                round(
-                    contradiction,
-                    2,
-                ),
-
-            "neutral_score":
-                round(
-                    neutral,
-                    2,
-                ),
-
-            "evidence_used":
-                evidence_used,
-
-            "verification_method":
-                "NLI",
+            "status": status,
+            "confidence": round(scores[status], 2),
+            "supported_score": round(entailment, 2),
+            "contradicted_score": round(contradiction, 2),
+            "neutral_score": round(neutral, 2),
+            "evidence_used": evidence_used,
+            "verification_method": "NLI",
         }
 
-    except Exception as error:
-
-        print(
-            "NLI verification failed:",
-            repr(error),
-        )
-
+    except Exception as exc:
+        print("NLI verification failed:", repr(exc))
         return {
-
-            "status":
-                "NEUTRAL",
-
-            "confidence":
-                0.0,
-
-            "supported_score":
-                0.0,
-
-            "contradicted_score":
-                0.0,
-
-            "neutral_score":
-                100.0,
-
-            "evidence_used":
-                evidence_used,
-
-            "verification_method":
-                "NLI_ERROR",
+            "status": "NEUTRAL",
+            "confidence": 0.0,
+            "supported_score": 0.0,
+            "contradicted_score": 0.0,
+            "neutral_score": 100.0,
+            "evidence_used": evidence_used,
+            "verification_method": "NLI_ERROR",
         }
 
-
-# ============================================================
-# VERIFY CLAIM AGAINST EVIDENCE
-# ============================================================
 
 def verify_claim_against_evidence(
-    claim,
-    evidence,
-):
-
-    deterministic = (
-        deterministic_verification(
-            claim,
-            evidence,
-        )
-    )
-
-    if deterministic is not None:
-
-        return deterministic
-
-    return nli_verify(
+    claim: str,
+    evidence: str,
+) -> Dict[str, Any]:
+    deterministic = deterministic_verification(
         claim,
         evidence,
     )
 
+    if deterministic is not None:
+        return deterministic
+
+    if NLI_AVAILABLE:
+        return nli_verify(claim, evidence)
+
+    return {
+        "status": "NEUTRAL",
+        "confidence": 0.0,
+        "supported_score": 0.0,
+        "contradicted_score": 0.0,
+        "neutral_score": 100.0,
+        "evidence_used": select_relevant_evidence(
+            claim,
+            evidence,
+        ),
+        "verification_method": "NO_SEMANTIC_VERIFIER",
+    }
+
 
 # ============================================================
-# DISTILBERT ASSESSMENT - INT8 ONNX
+# DISTILBERT ASSESSMENT
 # ============================================================
 
-def run_model_assessment(
-    content
-):
-
+def run_model_assessment(content: str) -> Dict[str, Any]:
     try:
-
         encoded = tokenizer(
             content,
             return_tensors="np",
@@ -3133,53 +1792,30 @@ def run_model_assessment(
         inputs = {}
 
         if "input_ids" in ONNX_INPUT_NAMES:
-
-            inputs["input_ids"] = (
-                np.asarray(
-                    encoded["input_ids"],
-                    dtype=np.int64,
-                )
+            inputs["input_ids"] = np.asarray(
+                encoded["input_ids"],
+                dtype=np.int64,
             )
 
         if "attention_mask" in ONNX_INPUT_NAMES:
-
-            inputs["attention_mask"] = (
-                np.asarray(
-                    encoded["attention_mask"],
-                    dtype=np.int64,
-                )
+            inputs["attention_mask"] = np.asarray(
+                encoded["attention_mask"],
+                dtype=np.int64,
             )
 
         if "token_type_ids" in ONNX_INPUT_NAMES:
-
-            if "token_type_ids" in encoded:
-
-                inputs["token_type_ids"] = (
-                    np.asarray(
-                        encoded["token_type_ids"],
-                        dtype=np.int64,
-                    )
-                )
-
-            else:
-
-                inputs["token_type_ids"] = (
-                    np.zeros_like(
-                        encoded["input_ids"],
-                        dtype=np.int64,
-                    )
-                )
+            inputs["token_type_ids"] = np.asarray(
+                encoded.get(
+                    "token_type_ids",
+                    np.zeros_like(encoded["input_ids"]),
+                ),
+                dtype=np.int64,
+            )
 
         outputs = onnx_session.run(
             None,
             inputs,
         )
-
-        if not outputs:
-
-            raise RuntimeError(
-                "ONNX model returned no outputs."
-            )
 
         logits = np.asarray(
             outputs[0],
@@ -3187,1018 +1823,515 @@ def run_model_assessment(
         )
 
         if logits.ndim == 1:
+            logits = logits.reshape(1, -1)
 
-            logits = logits.reshape(
-                1,
-                -1,
-            )
-
-        if logits.ndim != 2:
-
-            raise RuntimeError(
-                "Unexpected ONNX logits shape: "
-                f"{logits.shape}"
-            )
-
-        # Numerically stable softmax.
-        shifted = (
-            logits
-            - np.max(
-                logits,
-                axis=-1,
-                keepdims=True,
-            )
+        shifted = logits - np.max(
+            logits,
+            axis=-1,
+            keepdims=True,
         )
 
-        exp_logits = np.exp(
-            shifted
+        exp_logits = np.exp(shifted)
+        probabilities = exp_logits / np.sum(
+            exp_logits,
+            axis=-1,
+            keepdims=True,
         )
 
-        probabilities = (
-            exp_logits
-            /
-            np.sum(
-                exp_logits,
-                axis=-1,
-                keepdims=True,
-            )
-        )
-
-        predicted_id = int(
-            np.argmax(
-                probabilities[0]
-            )
-        )
-
+        predicted_id = int(np.argmax(probabilities[0]))
         confidence = (
-            float(
-                probabilities[
-                    0,
-                    predicted_id,
-                ]
-            )
-            * 100.0
+            float(probabilities[0, predicted_id]) * 100.0
         )
 
-        # Read the trained model's label mapping from config.json.
-        label = str(
-            predicted_id
-        )
+        label = str(predicted_id)
 
-        config_file = (
-            ONNX_MODEL_PATH
-            / "config.json"
-        )
-
+        config_file = ONNX_MODEL_PATH / "config.json"
         if config_file.exists():
-
             try:
-
-                with open(
-                    config_file,
-                    "r",
-                    encoding="utf-8",
-                ) as file:
-
-                    config = json.load(
-                        file
-                    )
-
-                id2label = (
-                    config.get(
-                        "id2label",
-                        {},
-                    )
+                config = json.loads(
+                    config_file.read_text(encoding="utf-8")
                 )
-
+                id2label = config.get("id2label", {})
                 label = str(
                     id2label.get(
                         str(predicted_id),
-                        id2label.get(
-                            predicted_id,
-                            label,
-                        ),
+                        id2label.get(predicted_id, label),
                     )
                 )
-
-            except Exception as error:
-
-                print(
-                    "Could not read ONNX label map:",
-                    repr(error),
-                )
+            except Exception as exc:
+                print("Label map read failed:", repr(exc))
 
         return {
-
-            "verdict":
-                label,
-
-            "confidence":
-                round(
-                    confidence,
-                    2,
-                ),
-
-            "model":
-                "DistilBERT",
-
-            "runtime":
-                "ONNX Runtime INT8",
-
+            "verdict": label,
+            "confidence": round(confidence, 2),
+            "model": "DistilBERT",
+            "runtime": "ONNX Runtime INT8",
         }
 
-    except Exception as error:
-
-        print(
-            "DistilBERT ONNX assessment failed:",
-            repr(error),
-        )
-
+    except Exception as exc:
+        print("DistilBERT assessment failed:", repr(exc))
         return {
-
-            "verdict":
-                "UNKNOWN",
-
-            "confidence":
-                0.0,
-
-            "model":
-                "DistilBERT",
-
-            "runtime":
-                "ONNX Runtime INT8",
-
+            "verdict": "UNKNOWN",
+            "confidence": 0.0,
+            "model": "DistilBERT",
+            "runtime": "ONNX Runtime INT8",
         }
 
 
 # ============================================================
-# EVIDENCE ASSESSMENT
+# EVIDENCE QUALITY / CONSENSUS
 # ============================================================
+
+def calculate_evidence_quality(
+    relevance: float,
+    verification: Dict[str, Any],
+    source_reliability: Dict[str, Any],
+) -> float:
+    relevance_score = max(0.0, min(float(relevance), 100.0))
+    verification_score = max(
+        0.0,
+        min(
+            float(verification.get("confidence", 0.0)),
+            100.0,
+        ),
+    )
+    reliability_score = max(
+        0.0,
+        min(
+            float(source_reliability.get("score", 50.0)),
+            100.0,
+        ),
+    )
+
+    quality = (
+        verification_score * 0.50
+        + relevance_score * 0.30
+        + reliability_score * 0.20
+    )
+
+    return round(quality, 2)
+
 
 def assess_evidence(
-    claim,
-    candidates,
-):
-
+    claim: str,
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     if not candidates:
-
         return {
-
-            "status":
-                "INSUFFICIENT_EVIDENCE",
-
-            "score":
-                0.0,
-
-            "sources":
-                [],
-
-            "best_evidence":
-                None,
-
-            "verification":
-                None,
+            "status": "INSUFFICIENT_EVIDENCE",
+            "score": 0.0,
+            "sources": [],
+            "best_evidence": None,
+            "verification": None,
+            "consensus": {},
         }
 
-    verified_candidates = []
+    verified = []
 
     for candidate in candidates:
-
-        verification = (
-            verify_claim_against_evidence(
-                claim,
-                candidate["text"],
-            )
+        verification = verify_claim_against_evidence(
+            claim,
+            candidate["text"],
         )
 
-        source_reliability = (
-            calculate_source_reliability(
-                candidate.get(
-                    "source",
-                    "",
-                ),
-                candidate.get(
-                    "title",
-                    "",
-                ),
-            )
-        )
-
-        evidence_quality = (
-            calculate_evidence_quality(
-                candidate.get(
-                    "relevance",
-                    0.0,
-                ),
-                verification,
-                source_reliability,
-            )
-        )
-
-        item = dict(
-            candidate
-        )
-
-        item[
-            "verification"
-        ] = verification
-
-        item[
+        reliability = candidate.get(
             "source_reliability"
-        ] = source_reliability
-
-        item[
-            "evidence_quality"
-        ] = evidence_quality
-
-        verified_candidates.append(
-            item
+        ) or calculate_source_reliability(
+            candidate.get("source", ""),
+            candidate.get("title", ""),
         )
 
-    # --------------------------------------------------------
-    # Deterministic results
-    # --------------------------------------------------------
+        quality = calculate_evidence_quality(
+            candidate.get("relevance", 0.0),
+            verification,
+            reliability,
+        )
 
-    explicit_supported = [
+        item = dict(candidate)
+        item["verification"] = verification
+        item["source_reliability"] = reliability
+        item["evidence_quality"] = quality
 
-        item
+        verified.append(item)
 
-        for item
-        in verified_candidates
+    # Only high-precision exact matches and actual NLI results can decide.
+    # Generic relation matching is intentionally excluded because token
+    # overlap is not reliable evidence of entailment or contradiction.
+    decisive_methods = {
+        "generic_exact_match",
+        "deterministic_evidence_match",
+        "NLI",
+    }
 
+    decisive = [
+        item for item in verified
         if (
-            item[
-                "verification"
-            ].get(
-                "verification_method"
-            )
-            ==
-            "deterministic_evidence_match"
-
-            and
-
-            item[
-                "verification"
-            ].get(
-                "status"
-            )
-            ==
-            "SUPPORTED"
+            item["verification"].get("status") in {"SUPPORTED", "CONTRADICTED"}
+            and item["verification"].get("verification_method") in decisive_methods
+            and item["evidence_quality"] >= MIN_EVIDENCE_QUALITY
         )
     ]
 
-    explicit_contradicted = [
+    support_weight = 0.0
+    contradiction_weight = 0.0
 
-        item
-
-        for item
-        in verified_candidates
-
-        if (
-            item[
-                "verification"
-            ].get(
-                "verification_method"
-            )
-            ==
-            "deterministic_evidence_match"
-
-            and
-
-            item[
-                "verification"
-            ].get(
-                "status"
-            )
-            ==
-            "CONTRADICTED"
+    for item in decisive:
+        weight = (
+            item["evidence_quality"]
+            / 100.0
         )
-    ]
+        if item["verification"]["status"] == "SUPPORTED":
+            support_weight += weight
+        else:
+            contradiction_weight += weight
 
-    # --------------------------------------------------------
-    # Highest-priority deterministic evidence
-    # --------------------------------------------------------
+    total = support_weight + contradiction_weight
 
-    if explicit_contradicted:
-
-        best = max(
-
-            explicit_contradicted,
-
-            key=lambda item: (
-
-                item.get(
-                    "evidence_quality",
-                    0.0,
-                ),
-
-                item[
-                    "verification"
-                ].get(
-                    "confidence",
-                    0.0,
-                ),
-
-                item.get(
-                    "relevance",
-                    0.0,
-                ),
-            ),
-        )
-
-        status = "CONTRADICTED"
-
-    elif explicit_supported:
-
-        best = max(
-
-            explicit_supported,
-
-            key=lambda item: (
-
-                item.get(
-                    "evidence_quality",
-                    0.0,
-                ),
-
-                item[
-                    "verification"
-                ].get(
-                    "confidence",
-                    0.0,
-                ),
-
-                item.get(
-                    "relevance",
-                    0.0,
-                ),
-            ),
-        )
-
-        status = "SUPPORTED"
-
+    if total <= 0:
+        final_status = "INSUFFICIENT_EVIDENCE"
+        final_score = 0.0
     else:
+        support_ratio = support_weight / total
+        contradiction_ratio = contradiction_weight / total
 
-        usable = [
+        # Require meaningful consensus. This prevents one weak
+        # result from forcing a verdict.
+        if support_ratio >= 0.65 and support_weight >= 0.80:
+            final_status = "SUPPORTED"
+            final_score = support_ratio * 100.0
+        elif (
+            contradiction_ratio >= 0.65
+            and contradiction_weight >= 0.80
+        ):
+            final_status = "CONTRADICTED"
+            final_score = contradiction_ratio * 100.0
+        else:
+            final_status = "INSUFFICIENT_EVIDENCE"
+            final_score = 0.0
 
-            item
-
-            for item
-            in verified_candidates
-
+    # If we have only one extremely strong authoritative source,
+    # allow it to decide even if consensus count is small.
+    if final_status == "INSUFFICIENT_EVIDENCE":
+        strong = [
+            item for item in decisive
             if (
-                item[
-                    "verification"
-                ].get(
-                    "status"
-                )
-                in {
-                    "SUPPORTED",
-                    "CONTRADICTED",
-                }
-
-                and
-
-                item[
-                    "verification"
-                ].get(
-                    "confidence",
-                    0.0,
-                )
-                >=
-                MIN_NLI_CONFIDENCE
+                item["evidence_quality"] >= 82.0
+                and item["source_reliability"]["score"] >= 88.0
+                and item["verification"].get("confidence", 0.0) >= 90.0
             )
         ]
 
-        if usable:
-
-            best = max(
-
-                usable,
-
-                key=lambda item: (
-
-                    item.get(
-                        "evidence_quality",
-                        0.0,
-                    ),
-
-                    item[
-                        "verification"
-                    ].get(
-                        "confidence",
-                        0.0,
-                    ),
-
-                    item.get(
-                        "relevance",
-                        0.0,
-                    ),
-                ),
+        if strong:
+            strong.sort(
+                key=lambda x: x["evidence_quality"],
+                reverse=True,
             )
+            strongest = strong[0]
+            final_status = strongest["verification"]["status"]
+            final_score = strongest["evidence_quality"]
 
-            status = (
-                best[
-                    "verification"
-                ][
-                    "status"
-                ]
-            )
-
-        else:
-
-            best = max(
-
-                verified_candidates,
-
-                key=lambda item: (
-
-                    item.get(
-                        "evidence_quality",
-                        0.0,
-                    ),
-
-                    item.get(
-                        "relevance",
-                        0.0,
-                    ),
-                ),
-            )
-
-            status = (
-                "INSUFFICIENT_EVIDENCE"
-            )
-
-    # --------------------------------------------------------
-    # Final score
-    # --------------------------------------------------------
-
-    if (
-        status
-        ==
-        "INSUFFICIENT_EVIDENCE"
-    ):
-
-        score = 0.0
-
-    else:
-
-        score = float(
-            best[
-                "verification"
-            ].get(
-                "confidence",
-                0.0,
-            )
-        )
-
-    # --------------------------------------------------------
-    # Sort evidence
-    # --------------------------------------------------------
-
-    verified_candidates.sort(
-
+    verified.sort(
         key=lambda item: (
-
-            item.get(
-                "evidence_quality",
-                0.0,
-            ),
-
-            item.get(
-                "relevance",
-                0.0,
-            ),
+            item["evidence_quality"],
+            item["relevance"],
+            item["source_reliability"]["score"],
         ),
-
         reverse=True,
     )
 
-    # --------------------------------------------------------
-    # Source cards
-    # --------------------------------------------------------
+    best = verified[0] if verified else None
 
     sources = []
+    for item in verified[:6]:
+        sources.append(
+            {
+                "title": item["title"],
+                "text": item["text"][:3500],
+                "source": item["source"],
+                "relevance": item["relevance"],
+                "verification": item["verification"],
+                "source_reliability": item["source_reliability"],
+                "evidence_quality": item["evidence_quality"],
+                "retrieval": item.get("retrieval", ""),
+            }
+        )
 
-    for candidate in (
-        verified_candidates[:5]
-    ):
+    best_evidence = None
+    best_verification = None
 
-        sources.append({
-
-            "title":
-                candidate["title"],
-
-            "text":
-                candidate[
-                    "text"
-                ][:3500],
-
-            "source":
-                candidate["source"],
-
-            "relevance":
-                candidate[
-                    "relevance"
-                ],
-
-            "verification":
-                candidate[
-                    "verification"
-                ],
-
-            "source_reliability":
-                candidate[
-                    "source_reliability"
-                ],
-
-            "evidence_quality":
-                candidate[
-                    "evidence_quality"
-                ],
-        })
-
-    # --------------------------------------------------------
-    # Best evidence
-    # --------------------------------------------------------
-
-    best_evidence = {
-
-        "title":
-            best["title"],
-
-        "text":
-            best["text"][:3500],
-
-        "source":
-            best["source"],
-
-        "relevance":
-            best["relevance"],
-
-        "verification":
-            best["verification"],
-
-        "source_reliability":
-            best[
-                "source_reliability"
-            ],
-
-        "evidence_quality":
-            best[
-                "evidence_quality"
-            ],
-    }
-
-    print("-" * 70)
-
-    print(
-        "FINAL EVIDENCE STATUS:",
-        status,
-    )
-
-    print(
-        "BEST EVIDENCE:",
-        best["title"],
-    )
-
-    print(
-        "RELEVANCE:",
-        best["relevance"],
-    )
-
-    print(
-        "EVIDENCE QUALITY:",
-        best[
-            "evidence_quality"
-        ],
-    )
-
-    print(
-        "CONFIDENCE:",
-        round(
-            score,
-            2,
-        ),
-    )
-
-    print("-" * 70)
+    if best:
+        best_verification = best["verification"]
+        best_evidence = {
+            "title": best["title"],
+            "text": best["text"][:3500],
+            "source": best["source"],
+            "relevance": best["relevance"],
+            "verification": best["verification"],
+            "source_reliability": best["source_reliability"],
+            "evidence_quality": best["evidence_quality"],
+            "retrieval": best.get("retrieval", ""),
+        }
 
     return {
-
-        "status":
-            status,
-
-        "score":
-            round(
-                max(
-                    0.0,
-                    min(
-                        score,
-                        100.0,
-                    ),
-                ),
-                2,
+        "status": final_status,
+        "score": round(min(final_score, 100.0), 2),
+        "sources": sources,
+        "best_evidence": best_evidence,
+        "verification": best_verification,
+        "consensus": {
+            "support_weight": round(support_weight, 3),
+            "contradiction_weight": round(
+                contradiction_weight,
+                3,
             ),
-
-        "sources":
-            sources,
-
-        "best_evidence":
-            best_evidence,
-
-        "verification":
-            best[
-                "verification"
-            ],
+            "decisive_sources": len(decisive),
+        },
     }
 
 
 # ============================================================
-# DIAGNOSTICS
+# EXPLANATION
 # ============================================================
 
-@app.get("/diagnostics")
-def diagnostics():
+def build_explanation(
+    claim: str,
+    evidence_assessment: Dict[str, Any],
+) -> str:
+    status = evidence_assessment.get(
+        "status",
+        "INSUFFICIENT_EVIDENCE",
+    )
+    best = evidence_assessment.get("best_evidence")
 
-    return {
+    if not best:
+        return (
+            "TruthLens AI could not retrieve enough relevant "
+            "evidence to make a reliable evidence-based decision."
+        )
 
-        "version":
-            "7.3.2",
+    title = best.get("title", "the retrieved source")
+    reliability = best.get(
+        "source_reliability",
+        {},
+    ).get("level", "UNKNOWN")
 
-        "device":
-            str(DEVICE),
+    if status == "SUPPORTED":
+        return (
+            f"Retrieved evidence from {title} ({reliability} "
+            "source reliability) supports the claim. The final "
+            "decision is based on evidence relevance, source "
+            "reliability, and claim/evidence verification."
+        )
 
-        "distilbert_loaded":
-            onnx_session is not None,
+    if status == "CONTRADICTED":
+        return (
+            f"Retrieved evidence from {title} ({reliability} "
+            "source reliability) conflicts with the claim. "
+            "The final decision is based on evidence rather than "
+            "the DistilBERT signal alone."
+        )
 
-        "nli_loaded":
-            NLI_AVAILABLE
-            and
-            nli_model is not None,
-
-        "nli_disabled":
-            DISABLE_NLI,
-
-        "canonical_claim_types":
-            sorted(
-                CANONICAL_EVIDENCE.keys()
-            ),
-
-        "page_cache_size":
-            len(
-                PAGE_CACHE
-            ),
-
-        "search_cache_size":
-            len(
-                SEARCH_CACHE
-            ),
-
-        "nli_labels":
-            NLI_LABEL_IDS,
-
-        "source_reliability_enabled":
-            True,
-
-        "evidence_quality_enabled":
-            True,
-    }
+    return (
+        "The retrieved material did not establish whether the claim is true "
+        "or false with sufficient confidence. The system therefore reports "
+        "INSUFFICIENT EVIDENCE rather than guessing from keyword overlap. "
+        "When semantic NLI verification is disabled, this conservative result "
+        "may occur more often."
+    )
 
 
 # ============================================================
-# ROOT
+# ROUTES
 # ============================================================
 
 @app.get("/")
 def root():
-
-    verification_methods = (
-        "Canonical Evidence + Wikipedia + "
-        "deterministic verification"
-    )
+    methods = [
+        "Dynamic Wikipedia retrieval",
+        "Dynamic Wikidata retrieval",
+        "Generic evidence verification",
+        "Source reliability",
+        "Evidence consensus",
+        "DistilBERT INT8 ONNX",
+    ]
 
     if NLI_AVAILABLE:
-
-        verification_methods += (
-            " + NLI"
-        )
+        methods.append("NLI semantic verification")
 
     return {
-
-        "message":
-            "Welcome to TruthLens AI",
-
-        "status":
-            "Backend is running",
-
-        "version":
-            "7.3.2",
-
-        "model":
-            "DistilBERT",
-
-        "verification":
-            verification_methods,
-
-        "decision_policy":
-            (
-                "Evidence assessment determines "
-                "the final verdict"
-            ),
-
-        "nli_enabled":
-            NLI_AVAILABLE,
+        "message": "Welcome to TruthLens AI",
+        "status": "Backend is running",
+        "version": APP_VERSION,
+        "verification_methods": methods,
+        "decision_policy": (
+            "Final verdict is determined from retrieved evidence "
+            "and evidence consensus, not DistilBERT alone."
+        ),
     }
 
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.get("/health")
 def health_check():
-
     return {
-
-        "status":
-            "healthy",
-
-        "model_loaded":
-            onnx_session is not None,
-
-        "nli_loaded":
-            NLI_AVAILABLE,
-
-        "nli_disabled":
-            DISABLE_NLI,
-
-        "device":
-            str(DEVICE),
-
-        "evidence_enabled":
-            True,
-
-        "canonical_evidence":
-            True,
-
-        "wikipedia_search":
-            True,
-
-        "deterministic_verification":
-            True,
-
-        "semantic_verification":
-            NLI_AVAILABLE,
-
-        "source_reliability":
-            True,
-
-        "evidence_quality":
-            True,
+        "status": "healthy",
+        "model_loaded": onnx_session is not None,
+        "nli_loaded": NLI_AVAILABLE,
+        "nli_disabled": DISABLE_NLI,
+        "device": DEVICE,
+        "evidence_enabled": True,
+        "dynamic_retrieval": True,
+        "wikipedia_search": True,
+        "wikidata_search": True,
+        "optional_web_search": bool(
+            SERPER_API_KEY or TAVILY_API_KEY
+        ),
+        "generic_verification": True,
+        "semantic_verification": NLI_AVAILABLE,
+        "source_reliability": True,
+        "evidence_consensus": True,
     }
 
 
-# ============================================================
-# ANALYZE
-# ============================================================
+@app.get("/diagnostics")
+def diagnostics():
+    return {
+        "version": APP_VERSION,
+        "device": DEVICE,
+        "onnx_model": str(ONNX_MODEL_FILE),
+        "onnx_loaded": onnx_session is not None,
+        "nli_loaded": NLI_AVAILABLE,
+        "nli_disabled": DISABLE_NLI,
+        "nli_labels": NLI_LABEL_IDS,
+        "dynamic_retrieval": {
+            "wikipedia": True,
+            "wikidata": True,
+            "serper": bool(SERPER_API_KEY),
+            "tavily": bool(TAVILY_API_KEY),
+        },
+        "cache_sizes": {
+            "pages": len(PAGE_CACHE),
+            "search": len(SEARCH_CACHE),
+            "wikidata": len(WIKIDATA_CACHE),
+        },
+    }
+
 
 @app.post("/analyze")
-def analyze_content(
-    request: AnalyzeRequest,
-):
-
-    content = (
-        request.content
-        .strip()
-    )
+def analyze_content(request: AnalyzeRequest):
+    content = clean_display_text(request.content)
 
     if not content:
-
         return {
-
-            "success":
-                False,
-
-            "message":
-                "No content was provided.",
-
-            "content":
-                "",
+            "success": False,
+            "message": "No content was provided.",
+            "content": "",
         }
 
     print("=" * 70)
-
-    print(
-        "ANALYZING CLAIM:",
-        content,
-    )
-
+    print("ANALYZING CLAIM:", content)
     print("=" * 70)
 
-    # --------------------------------------------------------
-    # STEP 1 — DistilBERT
-    # --------------------------------------------------------
+    claim_type = detect_claim_type(content)
+    entities = extract_claim_entities(content)
+    search_queries = generate_search_queries(content)
 
-    model_assessment = (
-        run_model_assessment(
-            content
-        )
+    # 1. ML signal.
+    model_assessment = run_model_assessment(content)
+
+    # 2. Dynamic retrieval.
+    candidates = retrieve_evidence(content)
+
+    # 3. Evidence assessment.
+    evidence_assessment = assess_evidence(
+        content,
+        candidates,
     )
 
-    # --------------------------------------------------------
-    # STEP 2 — Evidence retrieval
-    # --------------------------------------------------------
+    evidence_status = evidence_assessment["status"]
+    evidence_score = evidence_assessment["score"]
 
-    candidates = (
-        retrieve_evidence(
-            content
-        )
-    )
-
-    # --------------------------------------------------------
-    # STEP 3 — Evidence assessment
-    # --------------------------------------------------------
-
-    evidence_assessment = (
-        assess_evidence(
-            content,
-            candidates,
-        )
-    )
-
-    evidence_status = (
-        evidence_assessment[
-            "status"
-        ]
-    )
-
-    evidence_score = (
-        evidence_assessment[
-            "score"
-        ]
-    )
-
-    # --------------------------------------------------------
-    # STEP 4 — Final decision
-    # --------------------------------------------------------
-
-    if (
-        evidence_status
-        ==
-        "SUPPORTED"
-    ):
-
-        final_verdict = (
-            "SUPPORTED"
-        )
-
-        final_confidence = (
-            evidence_score
-        )
-
+    if evidence_status == "SUPPORTED":
+        final_verdict = "SUPPORTED"
+        final_confidence = evidence_score
         basis = (
-            "Relevant external evidence "
-            "supports the claim."
+            "Retrieved evidence supports the claim with sufficient "
+            "relevance, source reliability, and verification strength."
         )
 
-    elif (
-        evidence_status
-        ==
-        "CONTRADICTED"
-    ):
-
-        final_verdict = (
-            "CONTRADICTED"
-        )
-
-        final_confidence = (
-            evidence_score
-        )
-
+    elif evidence_status == "CONTRADICTED":
+        final_verdict = "CONTRADICTED"
+        final_confidence = evidence_score
         basis = (
-            "Relevant external evidence "
-            "contradicts the claim."
+            "Retrieved evidence contradicts the claim with sufficient "
+            "relevance, source reliability, and verification strength."
         )
 
     else:
-
-        final_verdict = (
-            "INSUFFICIENT EVIDENCE"
-        )
-
+        final_verdict = "INSUFFICIENT EVIDENCE"
         final_confidence = 0.0
-
         basis = (
-            "Available evidence was not "
-            "sufficiently relevant or conclusive."
+            "Available evidence was not sufficiently relevant, "
+            "reliable, or consistent to make a safe binary decision."
         )
-
-    # --------------------------------------------------------
-    # Evidence basis
-    # --------------------------------------------------------
 
     evidence_basis = (
-        "Canonical evidence + Wikipedia "
-        "search + relevance ranking + "
-        "deterministic matching + "
-        "source reliability"
+        "Dynamic Wikipedia + Wikidata retrieval + generic claim/evidence "
+        "verification + source reliability + evidence consensus + "
+        "DistilBERT INT8 initial assessment"
     )
 
     if NLI_AVAILABLE:
+        evidence_basis += " + NLI semantic verification"
 
-        evidence_basis += (
-            " + NLI verification"
-        )
-
-    # --------------------------------------------------------
-    # Logging
-    # --------------------------------------------------------
+    explanation = build_explanation(
+        content,
+        evidence_assessment,
+    )
 
     print("=" * 70)
-
-    print(
-        "FINAL VERDICT:",
-        final_verdict,
-    )
-
-    print(
-        "FINAL CONFIDENCE:",
-        final_confidence,
-    )
-
+    print("CLAIM TYPE:", claim_type)
+    print("ENTITIES:", entities)
+    print("FINAL VERDICT:", final_verdict)
+    print("FINAL CONFIDENCE:", final_confidence)
     print(
         "EVIDENCE SOURCES:",
-        len(
-            evidence_assessment[
-                "sources"
-            ]
-        ),
+        len(evidence_assessment.get("sources", [])),
     )
-
     print("=" * 70)
 
-    # --------------------------------------------------------
-    # Response
-    # --------------------------------------------------------
-
     return {
+        "success": True,
+        "content": content,
 
-        "success":
-            True,
-
-        "content":
-            content,
-
-        "model_assessment":
-            model_assessment,
-
-        "evidence_assessment":
-            evidence_assessment,
-
-        "final_assessment": {
-
-            "verdict":
-                final_verdict,
-
-            "confidence":
-                round(
-                    final_confidence,
-                    2,
-                ),
-
-            "basis":
-                basis,
+        # Useful for debugging and UI.
+        "claim_analysis": {
+            "claim_type": claim_type,
+            "entities": entities,
+            "search_queries": search_queries,
         },
 
-        # ----------------------------------------------------
-        # Frontend compatibility
-        # ----------------------------------------------------
+        "model_assessment": model_assessment,
 
-        "verdict":
-            final_verdict,
+        "evidence_assessment": evidence_assessment,
 
-        "confidence":
-            round(
-                final_confidence,
-                2,
-            ),
+        "final_assessment": {
+            "verdict": final_verdict,
+            "confidence": round(final_confidence, 2),
+            "basis": basis,
+            "explanation": explanation,
+        },
 
-        "model":
-            "DistilBERT",
-
-        "decision_method":
-            (
-                "Final verdict is determined "
-                "by evidence assessment, not "
-                "by the DistilBERT ML signal alone."
-            ),
-
-        "evidence_basis":
-            evidence_basis,
-
-        "nli_enabled":
-            NLI_AVAILABLE,
+        # Frontend compatibility.
+        "verdict": final_verdict,
+        "confidence": round(final_confidence, 2),
+        "model": "DistilBERT",
+        "decision_method": (
+            "Final verdict is determined by dynamically retrieved "
+            "evidence and evidence consensus, not by the DistilBERT "
+            "ML signal alone."
+        ),
+        "evidence_basis": evidence_basis,
+        "nli_enabled": NLI_AVAILABLE,
     }
 
 
@@ -4207,65 +2340,23 @@ def analyze_content(
 # ============================================================
 
 print("=" * 70)
-
+print("TruthLens AI backend ready.")
+print("DistilBERT:", "ACTIVE")
+print("Model Runtime:", "ONNX Runtime INT8")
+print("Dynamic Wikipedia:", "ACTIVE")
+print("Dynamic Wikidata:", "ACTIVE")
 print(
-    "TruthLens AI backend ready."
+    "Optional Web Search:",
+    "ACTIVE" if (SERPER_API_KEY or TAVILY_API_KEY) else "NOT CONFIGURED",
 )
-
 print(
-    "DistilBERT:",
-    "ACTIVE"
-    if onnx_session is not None
-    else
-    "INACTIVE",
-)
-
-print(
-    "Model Runtime:",
-    "ONNX Runtime INT8",
-)
-
-print(
-    "Wikipedia Search:",
+    "Generic Verification:",
     "ACTIVE",
 )
-
-print(
-    "Wikipedia Evidence:",
-    "ACTIVE",
-)
-
-print(
-    "Canonical Evidence:",
-    "ACTIVE",
-)
-
-print(
-    "Deterministic Verification:",
-    "ACTIVE",
-)
-
 print(
     "NLI Verification:",
-    "ACTIVE"
-    if NLI_AVAILABLE
-    else
-    "DISABLED",
+    "ACTIVE" if NLI_AVAILABLE else "DISABLED",
 )
-
-print(
-    "Source Reliability:",
-    "ACTIVE",
-)
-
-print(
-    "Evidence Quality:",
-    "ACTIVE",
-)
-
-print(
-    "India Classification Contradiction Guard:",
-    "ACTIVE",
-)
-
+print("Source Reliability:", "ACTIVE")
+print("Evidence Consensus:", "ACTIVE")
 print("=" * 70)
